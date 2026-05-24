@@ -1,0 +1,225 @@
+# aether-knowledge — Publish Workflow
+#
+# Validates, deploys, dry-runs, and rolls back KOSLAB Aether v0.4
+# publications. Implements E5-D.2 from the v0.4 dogfooding plan.
+#
+# Triggers
+# --------
+# - push tag `pub-v*.*.*` → validate → deploy to GitHub Pages.
+# - workflow_dispatch mode=dry-run → validate only, with summary.
+# - workflow_dispatch mode=rollback → checkout target tag, validate,
+#   force-redeploy.
+#
+# Tag protection: the `pub-*` tag protection rule (configured at the
+# repo level) prevents accidental tag creation. Only repo admins can
+# push `pub-v*` tags.
+#
+# Verification: the `ckl` binary is pinned to a specific release and
+# verified by SHA256 before use. `ckl verify-publication` runs in
+# --strict mode so warnings (oversize layout, zero TTL, ...) fail CI.
+#
+# Empty-publishers guard: if `publishers/koslab/pkg/` doesn't exist
+# yet (first dogfooding period before E5-F lands the first real
+# publish), `validate` and `dry-run` skip the verify step with a
+# warning instead of failing. The `deploy` job is gated on a tag, so
+# it only runs once a real publication exists.
+
+name: publish
+
+on:
+  push:
+    tags:
+      - 'pub-v*.*.*'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Dispatch mode'
+        type: choice
+        required: true
+        options:
+          - dry-run
+          - rollback
+      tag:
+        description: 'Tag to roll back to (rollback mode only)'
+        type: string
+        required: false
+        default: ''
+
+# A single deploy at a time. We deliberately do NOT cancel-in-progress:
+# a half-deployed Pages site is worse than a slightly-delayed deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+# Pinned `ckl` release. Bump when a newer release ships a v0.4-compatible
+# protocol implementation. Keep `CKL_SHA256` in sync with the asset's
+# published `.sha256` checksum.
+env:
+  CKL_VERSION: v0.5.32
+  CKL_ASSET: ckl-cli-x86_64-unknown-linux-gnu.tar.xz
+  CKL_SHA256: 5db39630d7250d640ef83412bcd6b489515e01c7b187ce2261409e170c6624d4
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────
+  # validate — runs on every trigger except rollback.
+  # Always uploads `verify-report.json` (or a skip marker) as an
+  # artifact so operators can audit the state of the layout.
+  # ───────────────────────────────────────────────────────────────────
+  validate:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'dry-run')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Download ckl binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "$CKL_VERSION" \
+            --repo Koslab-DevOrg/ckl \
+            --pattern "$CKL_ASSET" \
+            --dir ckl-dl
+          echo "$CKL_SHA256  ckl-dl/$CKL_ASSET" | sha256sum -c -
+          tar -xJf "ckl-dl/$CKL_ASSET" -C ckl-dl
+          # Asset extracts to a versioned subdir; locate `ckl` binary.
+          CKL_BIN=$(find ckl-dl -type f -name ckl -perm -u+x | head -n1)
+          install -m 0755 "$CKL_BIN" /usr/local/bin/ckl
+          ckl --version
+
+      - name: Check for publication layout
+        id: layout
+        run: |
+          if [ -f publishers/koslab/pkg/manifest.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No publication layout at publishers/koslab/pkg/ — skipping verify (expected during pre-E5-F dogfooding)."
+          fi
+
+      - name: Verify publication layout
+        if: steps.layout.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          ckl verify-publication ./publishers/koslab --strict --json > verify-report.json
+          echo "### Verify report" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat verify-report.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write skip marker
+        if: steps.layout.outputs.present != 'true'
+        run: |
+          printf '{"skipped":true,"reason":"no publishers/koslab/pkg/ layout"}\n' > verify-report.json
+          echo "### Verify report" >> "$GITHUB_STEP_SUMMARY"
+          echo "_Skipped — no publication layout yet._" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verify report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report
+          path: verify-report.json
+
+  # ───────────────────────────────────────────────────────────────────
+  # deploy — only on a `pub-v*` tag push with validate green.
+  # ───────────────────────────────────────────────────────────────────
+  deploy:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/pub-v')
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          # Repo root: CNAME + .nojekyll + index.html + publishers/.
+          path: '.'
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  # ───────────────────────────────────────────────────────────────────
+  # dry-run — alias for validate with extra summary output.
+  # `validate` already runs in dry-run dispatches (see its `if:`); this
+  # job exists so the summary lives in a separate step that's easy to
+  # locate in the Actions UI.
+  # ───────────────────────────────────────────────────────────────────
+  dry-run-summary:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'dry-run'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          {
+            echo "### Dry run — ${{ github.ref }}"
+            echo
+            echo "- ckl version: \`$CKL_VERSION\`"
+            echo "- Validate job: success (see verify-report artifact)."
+            echo "- No deploy was triggered."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────
+  # rollback — checkout the operator-supplied tag, verify, redeploy.
+  # ───────────────────────────────────────────────────────────────────
+  rollback:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'rollback'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Require tag input
+        if: inputs.tag == ''
+        run: |
+          echo "::error::rollback requires a non-empty 'tag' input"
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Download ckl binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "$CKL_VERSION" \
+            --repo Koslab-DevOrg/ckl \
+            --pattern "$CKL_ASSET" \
+            --dir ckl-dl
+          echo "$CKL_SHA256  ckl-dl/$CKL_ASSET" | sha256sum -c -
+          tar -xJf "ckl-dl/$CKL_ASSET" -C ckl-dl
+          CKL_BIN=$(find ckl-dl -type f -name ckl -perm -u+x | head -n1)
+          install -m 0755 "$CKL_BIN" /usr/local/bin/ckl
+
+      - name: Verify rollback target
+        run: |
+          set -euo pipefail
+          if [ ! -f publishers/koslab/pkg/manifest.json ]; then
+            echo "::error::Rollback target ${{ inputs.tag }} has no publishers/koslab/pkg/ layout"
+            exit 1
+          fi
+          ckl verify-publication ./publishers/koslab --strict
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+      - id: deployment
+        uses: actions/deploy-pages@v4
