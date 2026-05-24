@@ -76,9 +76,18 @@ jobs:
 
       - name: Download ckl binary
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `Koslab-DevOrg/ckl` is private; the default `GITHUB_TOKEN`
+          # is scoped to this repo only. The operator must configure a
+          # repo secret `CKL_DOWNLOAD_TOKEN` (fine-grained PAT with
+          # `Contents: read` on `Koslab-DevOrg/ckl`). Without it, this
+          # step fails fast with a clear message.
+          GH_TOKEN: ${{ secrets.CKL_DOWNLOAD_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::CKL_DOWNLOAD_TOKEN secret is not configured. Add a fine-grained PAT with Contents:read on Koslab-DevOrg/ckl."
+            exit 1
+          fi
           gh release download "$CKL_VERSION" \
             --repo Koslab-DevOrg/ckl \
             --pattern "$CKL_ASSET" \
