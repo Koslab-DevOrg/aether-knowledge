@@ -205,7 +205,7 @@ jobs:
 
       - name: Download ckl binary
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.CKL_DOWNLOAD_TOKEN }}
         run: |
           set -euo pipefail
           gh release download "$CKL_VERSION" \
