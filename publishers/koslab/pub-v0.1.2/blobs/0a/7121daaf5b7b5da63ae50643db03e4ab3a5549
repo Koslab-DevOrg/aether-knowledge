@@ -1,0 +1,577 @@
+# Aether — Pipeline de Publicación KOSLAB (Dogfooding v0)
+
+> **Documento operacional** que define cómo KOSLAB se convierte en el **primer publisher** de Aether usando el package `ckl-internals` (knowledge interno del propio CKL) como conejillo de indias.
+>
+> Si Aether no sirve para publicar **nuestro propio conocimiento**, no sirve para nadie. Este doc cierra ese loop.
+
+**Pre-requisitos**: Doc #1 (Concepto) y Doc #2 (Arquitectura v0) — publicados y aprobados.
+
+---
+
+## 0. Por qué CKL internals es el primer package
+
+### 0.1 Criterios para escoger el primer package
+
+| Criterio | CKL internals | KOS patterns | Rust curado |
+|---|---|---|---|
+| Audiencia clara | ✅ devs de CKL/KOSLAB | ⚠️ usuarios de KOS | ⚠️ comunidad Rust |
+| Knowledge maduro | ✅ código + ADRs reales | ⚠️ producto nuevo | ⚠️ compite con docs oficiales |
+| Feedback loop corto | ✅ nosotros mismos somos consumers | ❌ requiere usuarios externos | ❌ requiere comunidad |
+| Validación end-to-end | ✅ doble rol publisher+consumer | ⚠️ solo publisher | ⚠️ solo publisher |
+| Riesgo reputacional | ✅ bajo (interno) | ⚠️ medio | ⚠️ alto |
+
+**Verdict**: CKL internals gana en los 5 ejes. Es el "Hello World" perfecto de Aether.
+
+### 0.2 Filosofía de dogfooding
+
+> *"Si vamos a pedirle al mundo que confíe en Aether para distribuir su conocimiento, primero tenemos que demostrar que confiamos en Aether para distribuir el nuestro."*
+
+Esto no es ceremonial — es funcional. Vamos a:
+- Publicar `ckl-internals` desde KOSLAB.
+- Consumir `ckl-internals` desde otra máquina KOSLAB (ej: laptop de Alex pulls del package que publica el de Sergio).
+- Notar fricciones, gaps, bugs **antes** de exponer Aether a usuarios externos.
+
+---
+
+## 1. Inventario del knowledge a publicar
+
+### 1.1 Qué SÍ publicamos (incluido en `ckl-internals`)
+
+| Categoría | Ejemplo | Origen |
+|---|---|---|
+| **ADRs** | "Por qué blob_oid es CAS" (v0.5.4) | docs/adr/*.md |
+| **Patrones de código** | "Sealed write pattern", "IntentEngine dispatch" | sesiones de design |
+| **Convenciones de naming** | `prj_*`, `src_*`, `blk_*`, `atm_*` | type definitions |
+| **Lessons learned** | "Por qué EvolutionAction NO tiene Edit" | git history + sesiones |
+| **Decisiones de arquitectura** | "CIP Gateway Policy v0.2.0", "Atoms first-class" | ADRs |
+| **Glosario técnico** | Definiciones de KronosSlice, Provenance, Layer, etc. | ckl-types |
+
+### 1.2 Qué NO publicamos (excluido por política)
+
+| Categoría | Por qué se excluye |
+|---|---|
+| Código fuente raw | Aether no es un mirror de Git; publicamos **knowledge sobre** el código, no el código |
+| Información de clientes | Confidencialidad |
+| Sesiones de chat exploratorias sin curar | Muchos contradicen, hay ruido — no graduado |
+| Knowledge marcado `internal_only` | Tag explícito en blocks/atoms |
+| Información de seguridad/secrets | Obvio, pero merece policy explícita |
+
+### 1.3 Tamaño estimado del primer slice
+
+- **Atomos**: ~150-300 (ADRs + patrones + decisiones)
+- **Slice size**: <2 MB serializado (CBOR + blobs deduplicados)
+- **Frecuencia esperada**: 1-2 slices por semana en estado estable
+
+---
+
+## 2. Trust setup — Claves de KOSLAB
+
+### 2.1 Modelo de claves
+
+```mermaid
+graph TD
+    Master[KOSLAB Root Key<br/>ed25519 master<br/>OFFLINE en HSM/hardware] -->|signs| Pub[Publisher Key<br/>ckl-internals<br/>online en CI]
+    Pub -->|signs| Slices[Slices firmados<br/>de ckl-internals]
+
+    Master -->|signs| Pub2[Publisher Key<br/>kos-patterns<br/>futuro]
+    Master -->|signs| Pub3[Publisher Key<br/>otro package futuro]
+
+    style Master fill:#fee2e2,stroke:#dc2626
+    style Pub fill:#fef3c7
+    style Pub2 fill:#fef3c7
+    style Pub3 fill:#fef3c7
+```
+
+**Dos niveles**:
+1. **Root key** de KOSLAB — nunca sale de almacenamiento offline (YubiKey o KMS hardware-backed). Solo se usa para **firmar las publisher keys**.
+2. **Publisher key** por package — vive online (en GitHub Actions secrets), firma los slices del día a día. Si se compromete, root key revoca y emite una nueva.
+
+### 2.2 Trust chain en consumer
+
+Un consumer verifica:
+```
+SignedSlice
+    └── signed by: PublisherKey("ckl-internals")
+            └── signed by: KoslabRootKey  ← anchor
+```
+
+Anchor key viene **embedded en CKL** como constante (igual que browsers tienen CA roots embedded). Se puede sobre-escribir con `ckl aether trust add <key>` para usar otros publishers.
+
+### 2.3 Setup checklist (pre-Hito 2)
+
+| # | Tarea | Responsable | Cuándo |
+|---|---|---|---|
+| T2.1 | Generar `koslab-root.key` en YubiKey | Sergio | Pre-H2 |
+| T2.2 | Backup en segundo YubiKey + caja fuerte | Sergio | Pre-H2 |
+| T2.3 | Documentar procedimiento de pérdida (rotation) | Sergio | Pre-H2 |
+| T2.4 | Generar `ckl-internals-publisher.key` en local, firmarla con root | Sergio | H2 |
+| T2.5 | Subir publisher key como GitHub secret en repo `aether-publications` | Sergio | H2 |
+| T2.6 | Embed root pubkey en `ckl-aether-sign` como constante | Alex | H2 |
+
+### 2.4 Política de rotación
+
+| Evento | Acción |
+|---|---|
+| Compromiso sospechado de publisher key | Revocar (con root), generar nueva, re-firmar slices recientes con la nueva |
+| Compromiso sospechado de root key | Procedimiento de emergencia: announce en repo, embed nueva en next CKL release |
+| Rotación rutinaria | Cada 12 meses publisher key, root nunca rota salvo emergencia |
+
+---
+
+## 3. Publisher workspace (layout)
+
+### 3.1 Workspace KOSLAB-pubs
+
+```
+~/.kos/workspaces/koslab-publications/
+├── workspace.json
+├── projects/
+│   └── aether-pubs/                    ← project que agrupa publishers
+│       ├── project.json
+│       └── sources/
+│           ├── ckl-internals/          ← Source kind: Aether
+│           │   ├── source.json         ← entity_id: ent_xxx
+│           │   ├── documents/          ← curated knowledge
+│           │   └── sessions/           ← curation sessions
+│           ├── kos-patterns/           ← futuro package
+│           └── rust-curado/            ← futuro package
+└── ckl-data/
+    └── entities/
+        ├── ent_xxx_ckl-internals/     ← KronosEntity bound
+        │   ├── slices/
+        │   ├── atoms/
+        │   └── records/
+        └── ent_yyy_kos-patterns/
+```
+
+**Invariante**: cada Source `Aether` en `aether-pubs` tiene su `entity_id` apuntando a un KronosEntity en `ckl-data/entities/`.
+
+### 3.2 Convención de naming
+
+| Tipo | Pattern | Ejemplo |
+|---|---|---|
+| Workspace publisher | `<org>-publications` | `koslab-publications` |
+| Project | `aether-pubs` | (singular para el workspace) |
+| Source name | `<package-id>` | `ckl-internals` |
+| URL pública | `<org>.github.io/aether-publications/<package-id>/` | `koslab.github.io/aether-publications/ckl-internals/` |
+
+---
+
+## 4. Pipeline de curación
+
+### 4.1 Flujo end-to-end
+
+```mermaid
+sequenceDiagram
+    participant Curator as Curador (humano)
+    participant WS as Workspace KOSLAB
+    participant Block as Block en sesión
+    participant CI as GitHub Actions
+    participant Repo as koslab/aether-publications
+    participant Pages as GitHub Pages
+
+    Curator->>WS: Trabajo normal en sesión
+    WS->>Block: Crea blocks/atomos en session_entity
+    Curator->>Block: Marca block con tag "ready-for-aether"
+    Note over Curator,Block: "Ready" = curado, validado, listo
+
+    Curator->>WS: Commit + push de marker
+    WS->>CI: Trigger via GitHub webhook
+    CI->>CI: Detecta blocks con tag "ready-for-aether"
+    CI->>CI: ckl aether publish --source ckl-internals
+    Note over CI: Internamente:<br/>1. publish_to_aether (graduación)<br/>2. commit_slice<br/>3. sign con publisher key<br/>4. write package layout
+    CI->>Repo: git push slice nuevo + manifest actualizado
+    Repo->>Pages: Auto-deploy
+    Pages-->>Pages: Available at koslab.github.io/aether-publications/ckl-internals/
+
+    Note over Curator,Pages: Tiempo total: ~2-5 minutos
+```
+
+### 4.2 El "ready-for-aether" marker
+
+**Mecanismo**: un tag/atributo en el block que el curador setea explícitamente.
+
+```rust
+// Internamente, esto añade el block a una "publish queue" del aether_source
+engine.execute(Intent::MarkForAether {
+    block_id,
+    aether_source: ckl_internals_source_id,
+    notes: Some("Decision sobre blob_oid CAS, ADR v0.5.4"),
+})?;
+```
+
+**UI/UX en KOS**: un botón "Publish to Aether" en el block, con un dropdown de targets si hay múltiples sources Aether.
+
+**Listas de cola**: el publisher workspace puede listar `engine.list_pending_aether(source_id)` para ver qué está en la cola.
+
+### 4.3 Curación como acto explícito
+
+El humano decide. El sistema NO publica auto un block solo porque "graduó". Esto preserva la calidad del package.
+
+**Tres compuertas antes de publicación**:
+1. **Compuerta 1 — Graduación interna**: el block ya tiene que haber pasado por `GraduationGate` estándar de session→shared (ya existe en CKL).
+2. **Compuerta 2 — Marker humano**: alguien marcó "ready-for-aether" explícitamente.
+3. **Compuerta 3 — Quality gate Aether**: gate más estricto que graduación normal (ver §7).
+
+---
+
+## 5. Canal de distribución
+
+### 5.1 Setup del repo
+
+```
+github.com/Koslab-DevOrg/aether-publications  (repo público)
+├── README.md                          # explica qué hay aquí
+├── .github/workflows/
+│   └── publish.yml                    # CI workflow
+├── ckl-internals/
+│   ├── manifest.json
+│   ├── slices/
+│   │   ├── slice_<hash>.cbor
+│   │   └── ...
+│   └── blobs/
+│       └── ...
+├── kos-patterns/                      # futuro
+└── rust-curado/                       # futuro
+```
+
+### 5.2 GitHub Pages config
+
+| Config | Valor |
+|---|---|
+| Branch | `main` |
+| Folder | `/` (root) |
+| Custom domain | (opcional, fase 2) `aether.koslab.ai` apuntando a Pages |
+| URL final fase 1 | `https://koslab-devorg.github.io/aether-publications/` |
+| URL final fase 2 | `https://aether.koslab.ai/` |
+
+### 5.3 CI workflow (GitHub Actions)
+
+**`.github/workflows/publish.yml`** (esquemático):
+
+```yaml
+name: Publish Aether Packages
+
+on:
+  workflow_dispatch:        # trigger manual
+  repository_dispatch:      # trigger desde otro repo (KOSLAB workspace)
+    types: [aether-publish]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ckl
+        run: cargo install ckl-cli --version 0.6+
+
+      - name: Pull pending blocks from workspace
+        env:
+          KOSLAB_WORKSPACE_TOKEN: ${{ secrets.WORKSPACE_TOKEN }}
+        run: ckl aether queue-pull --source ckl-internals
+
+      - name: Publish slice
+        env:
+          PUBLISHER_KEY: ${{ secrets.CKL_INTERNALS_KEY }}
+        run: |
+          ckl aether publish \
+            --source ckl-internals \
+            --output ./ckl-internals/
+
+      - name: Commit and push
+        run: |
+          git config user.name "Aether Bot"
+          git config user.email "agents-noreply@koslab.ai"
+          git add ckl-internals/
+          git commit -m "[ckl-internals] Slice $(date -I)"
+          git push
+```
+
+### 5.4 Verificación post-publish
+
+```bash
+# En máquina diferente:
+curl https://koslab-devorg.github.io/aether-publications/ckl-internals/manifest.json
+ckl aether subscribe https://koslab-devorg.github.io/aether-publications/ckl-internals/
+ckl aether sync
+ckl ask "qué es blob_oid CAS?"   # ← debe responder con knowledge del package
+```
+
+Si los tres comandos funcionan, el pipeline está vivo.
+
+---
+
+## 6. Cadencia y versionado
+
+### 6.1 Frecuencia de publicación
+
+| Fase | Frecuencia esperada | Trigger |
+|---|---|---|
+| MVP (primer mes) | Manual, ad-hoc | Sergio/Alex marca "ready" → CI dispara |
+| Estable (mes 2-3) | Semanal | Cron en CI: cada lunes pulls la queue y publica si hay algo |
+| Maduro (mes 4+) | Continuo | Cada `ready-for-aether` marker dispara CI |
+
+### 6.2 Versionado
+
+**Aether NO usa SemVer** — usa hashes. Cada slice ES su versión.
+
+```json
+// manifest.json
+{
+  "publisher": "koslab",
+  "package": "ckl-internals",
+  "latest_slice_hash": "a3f2c1...",
+  "slices": [
+    { "hash": "a3f2c1...", "parent": "b2d4f9...", "created_at": "2026-05-15T10:00:00Z", "trigger": "ADR added: blob_oid CAS" },
+    { "hash": "b2d4f9...", "parent": "c1e3a8...", "created_at": "2026-05-14T16:00:00Z", "trigger": "Pattern: sealed writes" },
+    { "hash": "c1e3a8...", "parent": null,        "created_at": "2026-05-13T11:00:00Z", "trigger": "Initial publish" }
+  ],
+  "signed_at": "2026-05-15T10:00:05Z",
+  "publisher_signature": "..."
+}
+```
+
+### 6.3 Tagging humano-amigable (opcional, fase 2)
+
+Para humanos:
+- `latest` → siempre apunta al último slice
+- `2026-Q2` → snapshot trimestral congelado (útil para reproducibilidad)
+- `pre-aether-mvp` → tag con nombre semántico
+
+Pero internamente CKL siempre opera con hashes — los tags son alias.
+
+---
+
+## 7. Quality gates específicos para Aether
+
+Comparado con la graduación normal session→shared:
+
+| Gate | Sesión normal | **Aether `ckl-internals`** |
+|---|---|---|
+| `min_weight` | 0.3 | **0.5** |
+| `min_layer` | `Low` | **`Medium`** |
+| `min_total_accesses` | 2 | **5** |
+| `min_coherence` | 0.6 | **0.8** |
+| `contradiction_free` | true | true |
+| `min_age_seconds` | 0 | **86400 (1 día)** |
+| Marker humano "ready" | no requerido | **REQUERIDO** |
+
+**Razonamiento**:
+- Más estricto en `weight` y `layer` → solo knowledge ya consolidado.
+- `min_age` evita publicar algo "fresco" que aún no ha sido validado por uso interno.
+- `coherence ≥ 0.8` reduce contradicciones públicas.
+- Marker humano es el último filtro: nada se publica sin curador explícito.
+
+---
+
+## 8. Métricas de éxito
+
+### 8.1 Métricas del pipeline (operacionales)
+
+| Métrica | Target MVP (primer mes) | Cómo medir |
+|---|---|---|
+| Slices publicados | ≥ 4 | git log del repo |
+| Atomos en el package al final del mes | 100-300 | manifest.json |
+| Tiempo curación → publish | < 10 min | timestamps CI |
+| Fallos en CI | 0 críticos | GitHub Actions logs |
+| Slices firmados verificables | 100% | test E2E semanal |
+
+### 8.2 Métricas de consumo (validación de utilidad)
+
+| Métrica | Target | Cómo medir |
+|---|---|---|
+| Consumers internos KOSLAB | 2 (Sergio + Alex en sus respectivas máquinas) | logs locales de `ckl aether sync` |
+| Queries respondidas por aether vs local | aether contribuye ≥ 20% en queries de CKL design | telemetry opcional |
+| Dedup rate al re-publicar | > 80% (mostrando que el sistema reconoce knowledge ya conocido) | GraduationOutcome::Reinforced count |
+| Bugs encontrados gracias al dogfooding | ≥ 5 (esto es éxito, no fracaso) | issues taggeados `aether-dogfooding` |
+
+### 8.3 Anti-métricas (cosas que indican que algo está mal)
+
+| Anti-métrica | Significa que... |
+|---|---|
+| Slice duplica >50% de atomos cada vez | El gate de quality es muy laxo, está pasando ruido |
+| Consumers no consultan el package | El knowledge no es útil — falla la curación |
+| Más de 1 incidente de firma fallida | Problema serio de keys o serialization |
+| Curadores marcando bloques al azar | Falta criterio de "ready-for-aether" claro |
+
+---
+
+## 9. Visión end-state: del dogfooding al uso global
+
+Este pipeline es la **fase 1** del end-state que discutimos. Cómo evoluciona:
+
+```mermaid
+graph LR
+    F1[Fase 1: KOSLAB solo<br/>ckl-internals como conejillo<br/><br/>1 publisher<br/>~3 consumers internos] --> F2[Fase 2: Multi-package KOSLAB<br/>+ multi-publisher externo<br/><br/>5-10 publishers<br/>cientos de consumers]
+    F2 --> F3[Fase 3: Registry + Discovery<br/>aether.koslab.ai como directorio<br/><br/>50+ publishers<br/>miles de consumers]
+    F3 --> F4[Fase 4: Federated mesh<br/>cada CKL es publisher+mirror<br/><br/>uso global<br/>resilencia P2P]
+
+    style F1 fill:#dcfce7
+    style F2 fill:#fef3c7
+    style F3 fill:#dbeafe
+    style F4 fill:#e0e7ff
+```
+
+| Fase | Cambios desde fase anterior |
+|---|---|
+| **F1 → F2** | Migrar de Pages a S3+CloudFront propio (`aether.koslab.ai`); abrir docs públicas para que terceros publiquen; añadir `kos-patterns` y `rust-curado` |
+| **F2 → F3** | Levantar registry searchable; añadir trust scoring; añadir estadísticas de adopción |
+| **F3 → F4** | Cada CKL puede actuar como mirror; añadir P2P sync; trust delegation chains |
+
+**Decisión clave**: cada fase es **adendum** sobre la anterior. Nada se rompe. F1 sigue funcionando aún cuando F4 esté en producción — es el principio de federación honesta.
+
+---
+
+## 10. Roadmap operacional
+
+```mermaid
+gantt
+    title Pipeline Aether KOSLAB — Roadmap operacional
+    dateFormat YYYY-MM-DD
+
+    section Pre-requisitos
+    Hito 1 (publish_to_aether local)        :h1, 2026-05-12, 17d
+    Hito 2 (signing)                         :h2, after h1, 12d
+
+    section Setup operacional
+    Trust setup (T2.1-T2.3)                  :t1, 2026-05-26, 7d
+    Generar publisher key (T2.4-T2.6)        :t2, after h2, 3d
+    Crear repo aether-publications           :t3, after t2, 1d
+    Setup GitHub Pages                       :t4, after t3, 1d
+    Crear workspace KOSLAB-pubs              :t5, 2026-05-26, 3d
+    Curar primeros 50 atomos                 :t6, after t5, 7d
+
+    section Pipeline
+    Hito 3 (formato canónico)                :h3, after h2, 12d
+    Escribir CI workflow                     :ci, after h3, 3d
+    Primer publish manual                    :first, after ci, 1d
+    Hito 4 (ckl-aether-client)               :h4, after h3, 17d
+    Test E2E publisher → consumer            :e2e, after h4, 3d
+
+    section Operación
+    Pipeline live (semanal)                  :ops, after e2e, 30d
+    Métricas + ajustes                       :metrics, after e2e, 30d
+```
+
+---
+
+## 11. Decisiones cerradas en este doc
+
+| ID | Decisión | Resolución |
+|----|----------|-----------|
+| **D4** | Primer Aether package | **`ckl-internals`** (CKL knowledge interno) |
+| **D5** | Modelo de operación | **Híbrido**: humano cura, CI publica |
+| **D6** | Canal de distribución MVP | **GitHub Pages** desde repo `koslab/aether-publications` |
+| **D7** | Modelo de claves | **2 niveles**: root offline + publisher online |
+| **D8** | Trigger de publish | **Marker humano "ready-for-aether"** en blocks |
+| **D9** | Versionado | **Hash-based** (no SemVer); tags humanos opcionales |
+| **D10** | Quality gates Aether | **Más estrictos** que graduación normal (ver §7) |
+| **D11** | Naming convention | `<org>.github.io/aether-publications/<package>/` |
+
+---
+
+## 12. Próximos pasos inmediatos
+
+### 12.1 En paralelo a Hito 1 (semanas 1-3)
+
+| # | Tarea | Responsable | Prerequisito |
+|---|---|---|---|
+| O1 | Crear repo `Koslab-DevOrg/aether-publications` (vacío con README) | Sergio | Ninguno |
+| O2 | Crear workspace local `koslab-publications` | Sergio | Ninguno |
+| O3 | Generar root key en YubiKey (T2.1) | Sergio | YubiKey física |
+| O4 | Empezar a curar primeros 50 atomos manualmente | Sergio + Alex | O2 |
+| O5 | Borrador de README público explicando qué es el repo | Sergio | O1 |
+
+### 12.2 Tras Hito 2 (firma) (semanas 4-5)
+
+- Generar publisher key y firmarla con root.
+- Subir publisher key como GitHub secret.
+- Embed root pubkey en `ckl-aether-sign`.
+
+### 12.3 Tras Hito 3 (formato canónico) (semanas 6-7)
+
+- Escribir el GitHub Actions workflow.
+- **Primer publish manual** (no CI todavía) — confirmar que el package se ve bien en GitHub Pages.
+- Iterar sobre el manifest, el README, etc.
+
+### 12.4 Tras Hito 4 (client) (semanas 8-9)
+
+- Test E2E real: laptop A publica, laptop B consume.
+- Documentar fricciones.
+- Decidir si se activa CI o se queda en publish manual semanal.
+
+---
+
+## Apéndice A — README público del repo (borrador)
+
+```markdown
+# Aether Publications by KOSLAB
+
+This repository hosts knowledge packages published by KOSLAB to the **Aether network**, the global knowledge layer of CKL.
+
+## What's here?
+
+- **`ckl-internals/`** — Knowledge about the CKL system itself: ADRs, patterns,
+  decisions, and conventions. Useful if you're building on CKL or contributing to it.
+
+## How to consume?
+
+Install `ckl` (v0.6+) and run:
+
+​```bash
+ckl aether subscribe https://koslab-devorg.github.io/aether-publications/ckl-internals/
+ckl aether sync
+ckl ask "your question about CKL"
+​```
+
+## Trust
+
+All slices in this repo are signed by KOSLAB's publisher key, which is itself
+signed by the KOSLAB root key. The root key fingerprint is embedded in CKL.
+
+To verify manually:
+​```bash
+ckl aether verify ckl-internals/slices/slice_<hash>.cbor
+​```
+
+## Becoming a publisher
+
+Want to publish your own Aether package? See [Aether Publisher Guide]
+(coming with v0.7).
+```
+
+---
+
+## Apéndice B — Checklist de "ready-for-aether"
+
+Antes de marcar un block como ready, el curador debe verificar:
+
+- [ ] El block tiene un tema claro y autosuficiente (no requiere contexto externo no publicado)
+- [ ] No contiene información confidencial, de clientes, o sobre infraestructura privada
+- [ ] Ha sido revisado por al menos 1 persona además del autor
+- [ ] No contradice slices ya publicados (o si lo hace, hay un advisory explicando por qué)
+- [ ] La graduación interna ya pasó (block está al menos en Layer::Medium)
+- [ ] El curador puede explicar en una frase **por qué** este conocimiento merece estar en Aether
+
+Si alguno falla → no se marca. El filtro humano es el último guardián de calidad.
+
+---
+
+## Apéndice C — Glosario operacional
+
+| Término | Significa |
+|---|---|
+| **Curador** | Humano (Sergio/Alex) que decide qué se publica |
+| **Publisher key** | Clave online que firma slices del día a día |
+| **Root key** | Clave offline que firma publisher keys |
+| **Trust anchor** | Pubkey embedded en CKL que valida el chain de KOSLAB |
+| **Marker** | Tag/atributo que indica "este block está listo para Aether" |
+| **Queue** | Lista de blocks marcados pero aún no publicados |
+| **Slice cursor** | Hash del último slice publicado (en manifest) |
+| **Trigger** | Mensaje humano-legible asociado a un slice nuevo (ej: "ADR added: blob_oid CAS") |
+| **Dogfooding** | Usar tu propio producto antes de venderlo a otros |
+
+---
+
+*Doc #3 de la serie Aether. Cierra el loop concepto → arquitectura → operación. Próximas iteraciones: docs sobre forks, federación y privacy a partir de la fase 2.*

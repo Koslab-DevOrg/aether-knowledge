@@ -1,0 +1,529 @@
+# Aether v0.3 — Área C: Grafo Cross-Package, Provenance y Visibility
+
+**Versión:** v0.3.2 (Área C, post-H8 closeout) · **Estado:** published · **Fecha:** 2026-05-13
+**Scope:** Modelo del grafo cuando múltiples publishers conviven en un mismo subscriber.
+
+> **Changelog v0.3.1 → v0.3.2 (2026-05-13):** Reconciliación post-implementación de H4-H8 (closeout de Área C). Cambios:
+> - §15: añadidos R11-R14 — visibility rules formalizadas tras H7-A/B/C y H8.
+> - §15: status de H4-H8 actualizado a ✅ closed.
+> - §15: nota sobre la composición allowlist ∧ Source.active.
+>
+> **Changelog v0.3 → v0.3.1 (2026-05-13):** Reconciliación post-implementación de H2+H3. Cambios:
+> - §3.2: `ProvenanceEntry` shape ajustado a la implementación (drop `signed_at` y `signature_hex`; renombrar `seq` → `package_seq`).
+> - §3.3: `aether_pending_edges` model rediseñado — opaque deterministic `PendingEdgeId` (SHA-256 desde `rel.id`) en lugar de composite PK; **FIFO cap** (no LRU); `ttl_secs=0` / `max_entries=0` desactivan TTL/cap respectivamente.
+> - §5.2/§5.3: Resolve hook fires on **every `put_block`** (cubre `Intent::CreateBlock` además del path de import); GC es **lazy on import-completion**, no background timer.
+> - Ver §15 para el log completo de reconciliación.
+**Predecesores:**
+- [Aether — Concepto y Principios (v0.1)](workspace://1177a168-7)
+- [Aether — Arquitectura v0 (Camino C: Inside-Out)](workspace://898db881-a)
+- [Aether v0.2 — Área B: Replay, Downgrade y Versionado](workspace://9125d9ca-8)
+- [Aether — Modelo de Amenazas y Endurecimiento (v0.3)](workspace://bf6f5e35-d)
+
+---
+
+## 1. Contexto y alcance
+
+Área B (v0.2) cerró las amenazas de **freshness** (replay, downgrade) y **DoS** (block flood). Área C cierra las amenazas y carencias funcionales del **grafo multi-publisher**:
+
+- **T14** — ID collision entre publishers distintos.
+- Capacidad real de **edges cross-publisher** (KOSLAB linkea un atom de Acme).
+- **Provenance** auditable por bloque ("¿de dónde vino esto?").
+- **Visibility & scoping** — el subscriber elige qué publishers ve, y cómo los filtra en queries.
+
+### 1.1 Principio rector: división Aether ↔ CKL
+
+> **Aether transporta conocimiento sin opinar sobre la semántica entre publishers.** Garantiza autenticidad, frescura, aislamiento y origen. La detección y resolución de **overlap, contradicciones o equivalencias** entre bloques de distintos publishers es **responsabilidad de CKL** (vía Kronos cycles, relaciones explícitas, contradiction-detection).
+
+Aether expone los primitivos (provenance, edges tipados cross-publisher, `same_as` relationship type); CKL los usa.
+
+### 1.2 Fuera de alcance
+
+- ❌ Merge automático de "bloques que parecen el mismo concepto" (vía embeddings o heurística).
+- ❌ Revocación de publisher keys (Área D, v0.4+).
+- ❌ Doble firma (autor + publisher) — Área D.
+- ❌ Confidencialidad (Aether sigue siendo público por diseño).
+
+---
+
+## 2. Decisiones tomadas
+
+| # | Decisión | Resolución | Wire impact |
+|---|---|---|---|
+| **D1** | Namespacing de IDs | **Composite PK** `(publisher_id, block_id)` en storage. ID público no cambia. | — |
+| **D2** | Cross-package edges huérfanos | **Lazy + pending table** con TTL 30d y cap 100k entradas. | — |
+| **D3** | Origin tracking | **Tabla separada `block_provenance`** (multi-source nativo, indexable, audit log). | — |
+| **D4** | "Mismo concepto" desde N publishers | **Tratar como bloques separados.** Reservar relación `same_as` como hook. Resolución semántica → CKL. | — |
+| **D5** | T14 phishing por impersonación | **Badge de publisher siempre visible (UI)** + **workspace allowlist** (default abierto, opt-in lockdown). | — |
+| **D6** | Visibility / scoping en queries | **Filtro `from_publisher` en query API** + **enable/disable por source** en UX. | — |
+| **D7** | Cross-publisher edges en el wire | **Campos tipados `to_publisher_id: Option<String>`, `from_publisher_id: Option<String>`** en `AetherRelationship`. **FORMAT_VERSION 3 → 4** con nuevo hash domain `b"ckl-aether-pkg-cbor-v4\0"`. | **bump** |
+
+### 2.1 Justificación de D7 (FORMAT_VERSION bump)
+
+Se descartó la convención string `"publisher:block_id"` por:
+
+1. **Stringly typed** — parser + reglas de escape viven para siempre en el código.
+2. **Hash domain sucio** — dos senders con intención idéntica producen bytes distintos según si auto-prefijan o no.
+3. **Sin extensibilidad** — añadir `target_seq` o `target_slice` mañana exige stringificar más cosas.
+4. **Defensa en profundidad rota** — el domain separator existe precisamente para que v3 y v4 no se confundan en replay.
+
+Estamos en v0.x; la maquinaria `MIN_SUPPORTED_FORMAT_VERSION` (Área B / H2) está hecha para rechazar gracefully paquetes incompatibles. Bumpear es la herramienta funcionando.
+
+---
+
+## 3. Modelo de datos
+
+### 3.1 Block — composite primary key
+
+```rust
+// crates/ckl-types/src/block.rs
+pub struct Block {
+    pub publisher_id: PublisherId,   // NEW — local sentinel "local" para bloques autoría propia
+    pub id: BlockId,
+    // ... resto sin cambios
+}
+
+// PK = (publisher_id, id)
+```
+
+`PublisherId` es un newtype `String` con la misma regex que Área B (`^[a-z0-9_-]{1,64}$`) más el valor reservado **`"local"`** para bloques autoría propia (no importados por Aether).
+
+### 3.2 `block_provenance` (D3)
+
+Implementado como tabla append-only sobre `AetherStore` (no es una tabla SQL nativa; SurrealKV usa byte-layout `provenance::{block_pub}::{block_id}::{imported_at_be}::{seq}` para que un prefix scan retorne entries chronological ASC).
+
+```rust
+// crates/ckl-types/src/provenance.rs
+pub struct ProvenanceEntry {
+    pub block_key: BlockKey,             // (block_publisher_id, block_id)
+    pub source_publisher_id: PublisherId, // quién publicó esta entrada (= pkg.publisher_id en import time)
+    pub slice_id: SliceId,
+    pub package_seq: u64,                // seq del package dentro del slice
+    pub imported_at: Timestamp,
+    pub signature_verified_at: Timestamp, // momento en que la firma del pkg fue verificada
+}
+```
+
+**Índices implementados (SurrealKV):**
+- `provenance_by_block::{block_pub}::{block_id}::{imported_at_be}::{seq}` — chronological reads ASC por `(block_pub, block_id)`.
+- `provenance_by_publisher::{source_pub}::{imported_at_be}::{block_pub}::{block_id}` — **DIFERIDO a H6** (no construido en H2 para mantener el diff focused; H6 lo materializa cuando expone `query.from_publisher`).
+
+Una entry por **import event**. Re-importar el mismo bloque añade entry; no sobreescribe. Es el audit log.
+
+**Campos elididos vs propuesta original:** `signed_at` (timestamp del publisher) y `signature_hex` (prefix del digest) fueron diferidos — `signature_verified_at` cubre el caso forense MVP. Si en Área D necesitamos forensics post-revocación con detalle del firmante, ambos campos vuelven en v0.4.
+
+### 3.3 `aether_pending_edges` (D2)
+
+Implementado como value-type sobre `AetherStore` con identidad determinística y tres KV namespaces.
+
+```rust
+// crates/ckl-types/src/pending_edge.rs
+pub struct PendingEdge {
+    pub id: PendingEdgeId,    // SHA-256 domain-separated desde rel.id → upsert idempotente
+    pub edge: Relationship,   // edge completo, ya con source/target_publisher_id stampeados (regla H0 reverse)
+    pub target_key: BlockKey, // (target_publisher_id, target_block_id) — drain index key
+    pub inserted_at: Timestamp,
+}
+
+// PendingEdgeId formato: "pde_<12-hex>"
+```
+
+**Decisión clave (post-implementación):** `PendingEdgeId` es **determinístico** desde `rel.id` (SHA-256 con domain separator). Esto convierte `enqueue_pending_edge` en un **upsert idempotente** — re-importar el mismo paquete no duplica entries, lo cual cubre re-publishes legítimos sin acumular pending state.
+
+**Namespaces SurrealKV (3, todos para soportar O(log n) lookups):**
+- `pending_edges::{id}` — primary row.
+- `pending_by_target::{tgt_pub}::{tgt_id}::{inserted_at_be}::{id}` — drain index. Prefix-scan en `{tgt_pub}::{tgt_id}::` retorna FIFO-ordered drainable rows.
+- `pending_by_age::{inserted_at_be}::{id}` — TTL sweep + FIFO cap eviction.
+
+**Parámetros (configurables en `RuntimeConfig`):**
+- `pending_edge_ttl_secs`: default `30 * 86400` (30 días). **`0` desactiva TTL.**
+- `pending_edge_max_entries`: default `100_000`. **`0` desactiva el cap.**
+- **Eviction policy: FIFO** (no LRU). Al alcanzarse el cap, los pendientes con `inserted_at` más antiguo se podan. LRU (con `last_touched_at`) queda como follow-up si la observación de producción indica que conviene privilegiar pendings recientemente consultados.
+
+### 3.4 `workspace_publisher_allowlist` (D5-C)
+
+```sql
+CREATE TABLE workspace_publisher_allowlist (
+    publisher_id    TEXT PRIMARY KEY,
+    root_pk_hex     TEXT NOT NULL,
+    allowed         INTEGER NOT NULL DEFAULT 1,  -- 1 = visible, 0 = oculto
+    added_at        INTEGER NOT NULL,
+    note            TEXT
+);
+```
+
+**Default abierto:** si un `publisher_id` no aparece en la tabla, se considera **visible**. Lock-down explícito: workspace owner setea `allowed=0` para publishers indeseados, o flipea un workspace setting `publisher_allowlist_mode = "strict"` que invierte la semántica (solo publishers explícitos visibles).
+
+---
+
+## 4. Wire format v4
+
+### 4.1 Constantes
+
+```rust
+// crates/ckl-aether-format/src/lib.rs
+pub const FORMAT_VERSION: u16 = 4;
+pub const MIN_SUPPORTED_FORMAT_VERSION: u16 = 4;  // v3 paquetes rechazados con error claro
+
+pub const HASH_DOMAIN_PKG: &[u8] = b"ckl-aether-pkg-cbor-v4\0";
+pub const HASH_DOMAIN_MANIFEST: &[u8] = b"ckl-aether-manifest-cbor-v1\0";  // sin cambios
+```
+
+### 4.2 `AetherRelationship` extendida
+
+```rust
+pub struct AetherRelationship {
+    pub from_block_id: String,
+    pub from_publisher_id: Option<String>,   // NEW — None ⇒ usa pkg.publisher_id
+    pub to_block_id: String,
+    pub to_publisher_id: Option<String>,     // NEW — None ⇒ usa pkg.publisher_id
+    pub kind: String,
+    pub direction: Direction,
+    pub metadata_json: Option<String>,
+}
+```
+
+**Semántica:**
+- `None` en `to_publisher_id` significa "target en mi propio publisher" → equivalente a `Some(pkg.publisher_id.clone())`. Sender puede ser explícito si quiere.
+- `Some("acme")` con `pkg.publisher_id == "koslab"` → edge cross-publisher koslab→acme.
+- En el canonical hash CBOR, omitir `None` (no incluir el key en el map) preserva el dominio v4 limpio.
+
+### 4.3 Compatibilidad
+
+- Paquetes v3 (de Área B) → **rechazados** con `RuntimeError::UnsupportedFormatVersion { got: 3, min: 4 }`.
+- KOSLAB re-publica su trilogía como v4 al merge de Área C. Single one-shot re-publish operacional.
+- `SliceManifest` no cambia (sigue v1).
+
+---
+
+## 5. Resolución de cross-package edges (D2)
+
+### 5.1 Máquina de estados
+
+```mermaid
+stateDiagram-v2
+    [*] --> CheckTarget: edge llega durante import
+    CheckTarget --> Imported: target (publisher, block) existe
+    CheckTarget --> Pending: target ausente
+    Pending --> Imported: sweep encuentra target tras import futuro
+    Pending --> Dropped: TTL expira o cap LRU
+    Dropped --> [*]: warning loggeado
+    Imported --> [*]
+```
+
+### 5.2 Flujo en `Intent::ImportAetherPackage` (v0.3)
+
+1. **Verify** chain + window (sin cambios desde v0.2).
+2. **Replay check** (sin cambios desde Área B).
+3. **Writes** sealed:
+   1. Para cada `AetherBlock` → upsert con composite PK `(pkg.publisher_id, block.id)` vía `put_block`.
+   2. Append entry a `block_provenance`.
+   3. Para cada `AetherRelationship`:
+      - Resolver `from_publisher_id` y `to_publisher_id` (default = `pkg.publisher_id`) vía la regla H0 reverse (`aether_bind`).
+      - Si **target existe** en storage → escribir rel.
+      - Si **target ausente** → `enqueue_pending_edge` (upsert idempotente vía `PendingEdgeId` determinístico).
+4. **Resolve hook (en cada `put_block`)** — *no es paso de import; es comportamiento del storage layer:* cada vez que un bloque es insertado (por import O por `Intent::CreateBlock`), `drain_resolved_edges(block_key)` retorna en FIFO order los pending edges cuyo target coincide y los re-inserta como edges live. Esto cubre el caso "publisher A llega después del importe que lo referencia" Y el caso "el bloque target lo crea el usuario localmente".
+5. **GC post-import** — al final de cada `execute_import_aether_package` exitoso: TTL sweep (`evict_expired_pending_edges(now - ttl)`) seguido de FIFO cap eviction (`evict_lru_pending_edges(max_entries)`). Counts surface via `post_actions`.
+6. **Advance cursor** (sin cambios desde Área B).
+
+### 5.3 Garbage collection
+
+- **Cuándo:** **lazy, on import-completion.** No background timer, no task asíncrono separado — evita infra async nueva y se serializa naturalmente con la pipeline de imports.
+- **Qué hace:**
+  1. TTL sweep: elimina entries con `inserted_at < now - pending_edge_ttl_secs` (skip si `ttl_secs == 0`).
+  2. Cap eviction: si `count > pending_edge_max_entries`, elimina los oldest por `inserted_at` hasta volver al cap (FIFO, skip si `max_entries == 0`).
+- **Best-effort:** los counts surface via `post_actions` para observability pero no hacen fail el import.
+- **Por qué lazy importa:** un publisher malicioso (o equivocado) puede inflar la tabla con edges-a-nada — el cap FIFO los descarta automáticamente sin necesidad de circuit breaker explícito.
+
+---
+
+## 6. Origin tracking & provenance API
+
+### 6.1 Escritura
+
+`Intent::ImportAetherPackage` siempre escribe a `block_provenance` aunque el bloque ya exista (los imports posteriores son la historia de re-publishes legítimos bajo seq creciente).
+
+### 6.2 Lectura
+
+Nueva intent **`Intent::GetBlockProvenance { block_key }`** → retorna `Vec<ProvenanceEntry>` ordenado **ASC** por `imported_at` (audit log natural — el primer import aparece primero).
+
+Ver §3.2 para el shape de `ProvenanceEntry` (implementación canónica en `crates/ckl-types/src/provenance.rs`).
+
+**Contrato local-vs-remote:** bloques con `publisher_id == PublisherId::LOCAL` (autoría local vía `Intent::CreateBlock`) **NO tienen entries en `block_provenance`**. La ausencia de provenance es la señal canónica de "in-workspace authorship". Solo bloques importados vía `Intent::ImportAetherPackage` generan provenance entries.
+
+### 6.3 Casos de uso
+
+- **Audit ("¿de dónde vino este bloque?")** — UI muestra la cadena completa de imports.
+- **Detección de re-publish** — si `provenance.len() > 1`, el bloque vino en múltiples slices/seqs.
+- **Forensics post-revocación (Área D)** — cuando una publisher key sea revocada, queremos saber qué bloques importamos firmados con ella.
+
+---
+
+## 7. Visibility, allowlist y query API (D5+D6)
+
+### 7.1 Query API
+
+Filtro nuevo opcional en `query.from_publisher(publisher_id)`:
+
+```rust
+let results = storage
+    .query()
+    .from_publisher(PublisherId::new("koslab"))
+    .with_block_type(BlockType::Decision)
+    .limit(20)
+    .run()
+    .await?;
+```
+
+Implementación: JOIN con `block_provenance` indexado en `source_publisher_id` (idx_provenance_publisher).
+
+### 7.2 Default behavior
+
+Sin `from_publisher` filter, la query devuelve **todos los bloques visibles según allowlist**. Si `publisher_allowlist_mode = "open"` (default), todos los bloques importados son visibles. Si `"strict"`, solo bloques de publishers con `allowed=1` aparecen.
+
+### 7.3 Per-source enable/disable (D6-B)
+
+Source de tipo `Aether` gana flag `active: bool`. Al desactivar, queries automáticamente excluyen bloques cuyo `source_publisher_id` matchee. UX-driven.
+
+### 7.4 UI badge (D5-A)
+
+Cada `Block` en la UI muestra un badge con el `source_publisher_id` (vía join con provenance). Defensivo y barato. Renderizado fuera de scope de este spec; queda como requisito para el front.
+
+---
+
+## 8. `same_as` relación (hook D4)
+
+### 8.1 Registro del tipo
+
+Añadir `"same_as"` al enum de `RelationshipKind` con:
+- **Direction:** `Bidirectional` (simétrica por construcción).
+- **Semántica:** "estos dos bloques representan el mismo concepto desde la óptica del subscriber".
+
+### 8.2 Aether NO la usa automáticamente
+
+Aether **no genera** relaciones `same_as` al importar. Es un primitive que CKL (o el usuario, o un agente) puede usar.
+
+### 8.3 CKL hooks (out of scope para Área C)
+
+- Kronos cycle detecta candidatos `same_as` vía embeddings → propone al usuario.
+- Query API: al traverse de `same_as`, dedup automático del subset.
+- Contradiction detection cross-publisher entre bloques marcados `same_as`.
+
+Esto vive en CKL, no aquí. Lo declaramos para que el tipo exista desde Área C y no haya migración cuando llegue v0.4+.
+
+---
+
+## 9. Migración v0.2 → v0.3
+
+### 9.1 Pasos en orden
+
+1. **Schema migrations** (idempotentes, gateadas por version):
+   - Añadir columna `publisher_id TEXT NOT NULL DEFAULT 'local'` a tabla `blocks`.
+   - Recomputar PK como `(publisher_id, id)`.
+   - Crear tablas nuevas: `block_provenance`, `aether_pending_edges`, `workspace_publisher_allowlist`.
+2. **Backfill `block_provenance`** para bloques previamente importados por Aether v0.2:
+   - Leer `import_log` (si existe) o derivar desde `current_slice` de cada bloque.
+   - Insertar una row por bloque con `source_publisher_id` derivado del slice.
+3. **Re-publish KOSLAB trilogía como v4** — comando one-shot del CI Aether (`aether-pages` job). v3 paquetes en el wire viejo son rechazados; nuevos suscriptores deben pullear v4.
+
+### 9.2 Compatibilidad runtime
+
+- `MIN_SUPPORTED_FORMAT_VERSION = 4` ⇒ paquetes v3 rechazados al import con error claro.
+- Subscribers v0.2 NO pueden importar paquetes v4 (correcto — fuerza upgrade).
+- Bloques locales pre-existentes quedan con `publisher_id = "local"`; visibles por default; no afecta queries existentes (filtro `from_publisher` es opt-in).
+
+---
+
+## 10. Hitos
+
+```mermaid
+graph LR
+  H0[H0<br/>FORMAT_VERSION 4<br/>cross-pub edge fields]
+  H1[H1<br/>Composite PK<br/>publisher_id en Block]
+  H2[H2<br/>block_provenance<br/>tabla + write]
+  H3[H3<br/>pending_edges<br/>lazy resolution + GC]
+  H4[H4<br/>cross-pub edge<br/>import logic]
+  H5[H5<br/>same_as<br/>relationship type]
+  H6[H6<br/>query API<br/>from_publisher filter]
+  H7[H7<br/>allowlist + source<br/>enable/disable]
+  H8[H8<br/>two-pub E2E<br/>cross-edge + provenance]
+
+  H0 --> H1 --> H2 --> H4
+  H0 --> H4
+  H3 --> H4
+  H2 --> H6
+  H1 --> H7
+  H4 --> H8
+  H5 --> H8
+  H6 --> H8
+  H7 --> H8
+```
+
+| Hito | Touches | Cobertura |
+|---|---|---|
+| **H0** | `ckl-aether-format`, `ckl-aether-sign` | Wire v4 + dominio + tests roundtrip + rechazo v3 |
+| **H1** | `ckl-types`, `ckl-store/{memory,surrealkv}`, `ckl-core/storage.rs` | Composite PK `(PublisherId, BlockId)` + backfill `"local"` |
+| **H2** | `ckl-store`, `ckl-runtime/protocol.rs` | Tabla `block_provenance` + write en `execute_import_aether_package` + intent `GetBlockProvenance` |
+| **H3** | `ckl-store`, `ckl-runtime` | Tabla `aether_pending_edges` + sweep + GC + RuntimeConfig knobs |
+| **H4** | `ckl-runtime/protocol.rs` | Resolución de `to_publisher_id/from_publisher_id` en import; happy path + huérfano path |
+| **H5** | `ckl-types/relationship.rs` | Registro de `RelationshipKind::SameAs`, bidireccional |
+| **H6** | `ckl-store`, `ckl-runtime/query.rs` | `query.from_publisher()` + índices |
+| **H7** | `ckl-store`, `ckl-types/document.rs` | Tabla `workspace_publisher_allowlist` + `Source.active` flag + integración en queries |
+| **H8** | `crates/ckl-runtime/tests/aether_cross_publisher_e2e.rs` | Dos publishers, cross-pkg edges, provenance assertions, visibility toggle |
+
+---
+
+## 11. Tests previstos
+
+### 11.1 Unit (por crate)
+
+- `ckl-aether-format`:
+  - `format_version_is_4`, `min_supported_is_4`, `v3_package_rejected`.
+  - `relationship_with_cross_publisher_target_roundtrips`.
+  - `relationship_canonical_hash_omits_none_publisher_ids`.
+- `ckl-aether-sign`: roundtrip con dominio v4.
+- `ckl-types`: composite PK ordering; `RelationshipKind::SameAs` bidirectional.
+
+### 11.2 Storage
+
+- `memory.rs`: composite PK isolation entre publishers; `block_provenance` insert/read; `pending_edges` insert + sweep + GC; allowlist semantics.
+- `surrealkv_impl.rs`: durability + recovery para las 3 tablas nuevas.
+
+### 11.3 Runtime E2E
+
+- `aether_v03_cross_publisher_edge_resolves_when_target_arrives` (happy path D2).
+- `aether_v03_pending_edge_expires_after_ttl` (TTL path D2).
+- `aether_v03_pending_edge_cap_drops_lru` (cap path D2).
+- `aether_v03_provenance_appends_on_reimport` (D3).
+- `aether_v03_two_publishers_same_block_id_are_isolated` (D1, T14).
+- `aether_v03_same_as_relationship_roundtrip` (D4 hook).
+- `aether_v03_query_from_publisher_filters_correctly` (D6).
+- `aether_v03_allowlist_strict_mode_hides_publisher` (D5).
+- `aether_v03_two_publisher_e2e_with_cross_edge` (integración total).
+
+---
+
+## 12. No-objetivos (explícitos)
+
+- ❌ Merge automático "mismo concepto" (vía embeddings) — diferido a v0.4+ donde el pipeline esté maduro.
+- ❌ Revocación de publisher keys — Área D.
+- ❌ Trust pinning del root — v0.4+.
+- ❌ Doble firma — Área D.
+- ❌ Detección de contradicciones entre bloques cross-publisher — responsabilidad de CKL, no de Aether.
+
+---
+
+## 13. Diagrama de arquitectura — v0.3
+
+```mermaid
+graph TD
+  subgraph Publisher_K [Publisher: KOSLAB]
+    K_PKG[AetherPackage v4<br/>publisher=koslab]
+    K_REL[Relationship<br/>from=koslab/A<br/>to=acme/X]
+  end
+
+  subgraph Publisher_A [Publisher: Acme]
+    A_PKG[AetherPackage v4<br/>publisher=acme]
+    A_BLK[Block X]
+  end
+
+  subgraph Wire
+    W[(CBOR v4)]
+  end
+
+  subgraph Subscriber
+    IMP[ImportAetherPackage]
+    BLK[(blocks<br/>PK = publisher_id, id)]
+    PRV[(block_provenance)]
+    PND[(aether_pending_edges)]
+    ALW[(allowlist)]
+    Q[Query API<br/>from_publisher filter]
+  end
+
+  K_PKG --> W
+  A_PKG --> W
+  W --> IMP
+  IMP --> BLK
+  IMP --> PRV
+  K_REL -.target=acme/X.-> PND
+  A_BLK --> BLK
+  PND -.sweep al llegar acme/X.-> BLK
+  BLK --> Q
+  PRV --> Q
+  ALW --> Q
+```
+
+---
+
+## 14. Criterios de aceptación
+
+- [x] H0-H8 commiteados con tests verdes.
+- [x] `cargo test -p ckl-aether-format -p ckl-aether-sign -p ckl-types -p ckl-store -p ckl-runtime` verde.
+- [x] FORMAT_VERSION 3 packages rechazados con error tipado.
+- [x] Threat model bf6f5e35-d actualizado: **T14 → 🟢 covered (v0.3)**; T13 sigue pendiente (Área D).
+- [ ] PR `feat/aether-v0.3 → develop` con resumen de Área C.
+- [ ] KOSLAB trilogía re-publicada como v4 via CI Aether (`aether-pages` job).
+
+---
+
+**Próximo paso:** branch `feat/aether-v0.3` desde `develop` (post-merge de v0.2), implementar H0-H8 secuencialmente, commitear hito a hito, PR al final con resumen.
+
+---
+
+## 15. Log de reconciliación post-implementación
+
+Esta sección registra las divergencias entre el spec v0.3 original y la implementación real en `feat/aether-v0.3`. Se mantiene por trazabilidad — los cambios ya están aplicados arriba en el documento.
+
+### Status de hitos al 2026-05-13 (post-H8 closeout)
+
+| Hito | Branch HEAD | Status |
+|---|---|---|
+| H0 — Wire v4 | `018610d` | ✅ Closed |
+| H1 — Composite PK | `73ce759` → `687843a` | ✅ Closed (8 sub-step commits) |
+| H2 — `block_provenance` | `ed5875f` → `1fcce6e` | ✅ Closed (3 commits) |
+| H3 — `pending_edges` + GC | `bbb15de` → `96bc875` | ✅ Closed (2 commits) |
+| H4 — Cross-pub edge resolver | `baba12d` | ✅ Closed |
+| H5 — `same_as` bidirectional | `9ab2140` | ✅ Closed |
+| H6 — `find_blocks_by_source_publisher` | `c11090f` | ✅ Closed (R8/R10) |
+| H7-A — Allowlist table + RuntimeConfig | `edc8147` | ✅ Closed |
+| H7-B — `Source.active` + `SetSourceActive` | `8b634c9` | ✅ Closed |
+| H7-C — `is_publisher_visible` query gate | `8b634c9` | ✅ Closed |
+| H8 — Two-publisher full E2E | post-`8b634c9` | ✅ Closed |
+
+### Divergencias spec → implementación (R1-R10, post-H3)
+
+| # | Spec original (v0.3) | Implementación (post-H3) | Razón / Veredicto |
+|---|---|---|---|
+| **R1** | `ProvenanceEntry` con `signed_at` + `signature_hex` | Drop ambos; solo `signature_verified_at` | Forensics post-revocación es Área D; MVP solo necesita "verified at import time". Si Área D los necesita, vuelven. |
+| **R2** | `ProvenanceEntry.seq` | Renombrado a `package_seq` | Claridad: distingue el seq del package del seq interno del slice. |
+| **R3** | `aether_pending_edges` composite PK SQL | Opaque `PendingEdgeId` (SHA-256 desde `rel.id`) + 3 KV namespaces | Identidad determinística → upsert idempotente. Mejor para re-publishes legítimos. |
+| **R4** | "Cap LRU drop" | **FIFO cap** (single `pending_by_age` index) | Más simple, menos state (no `last_touched_at`). LRU queda como follow-up si producción lo indica. |
+| **R5** | "Sweep al final de cada import" (path único) | **Drain on every `put_block`** (cubre `Intent::CreateBlock` + import) | Más correcto — un usuario puede crear localmente un bloque referenciado por un import previo, y el pending edge debe resolverse. |
+| **R6** | "Background task cada N imports o timer 1h" | **Lazy on import-completion** | Evita infra async nueva. Lazy es suficiente para la carga esperada. |
+| **R7** | (sin mención) | `ttl_secs=0` desactiva TTL; `max_entries=0` desactiva cap | Ergonomía para testing y para deployments que prefieran sin GC. |
+| **R8** | `provenance_by_publisher` index construido en H2 | **Diferido a H6**, materializado en `find_blocks_by_source_publisher` | Mantener H2 diff focused. H6 cierra la query path completa. |
+| **R9** | `Intent::GetBlockProvenance { block_publisher_id, block_id }` | `Intent::GetBlockProvenance { block_key }` con `BlockKey` newtype | Composite key es first-class value type en `ckl-types` (introducido por H1). |
+| **R10** | Local blocks sin contrato explícito sobre provenance | **Contrato: bloques con `publisher_id == LOCAL` NO tienen entries** | Ausencia de provenance = "in-workspace authorship". 3 e2e tests pinean este contrato. |
+
+### Reglas de visibility (R11-R14, post-H7/H8)
+
+Estas reglas formalizan el comportamiento del gate `is_publisher_visible` y de `find_blocks_by_source_publisher` introducidos por H6, H7-A, H7-B y H7-C. Son las **reglas vivas** que la implementación impone — el resto del spec (§7) las describe a alto nivel; aquí se pinea su contrato verificable por tests.
+
+| # | Regla | Implementación | Tests que lo pinea |
+|---|---|---|---|
+| **R11** | **Allowlist gates publishers no-LOCAL.** El modo `RuntimeConfig.publisher_allowlist_mode` ∈ {`Open`, `Strict`} determina la política. `Open`: visible por defecto, oculta sólo si existe row con `allowed=false` (deny-list). `Strict`: oculto por defecto, visible sólo si existe row con `allowed=true` (allow-list). | `CklRuntime::is_publisher_visible` + `AetherStore::get_publisher_allowlist_entry` | `aether_v03_allowlist_e2e::open_mode_empty_allowlist_is_visible`, `open_mode_explicit_deny_hides`, `strict_mode_empty_allowlist_hides`, `strict_mode_explicit_allow_makes_visible` |
+| **R12** | **Per-call gate, no global state.** Ocultar un publisher no afecta queries sobre otros publishers. La visibilidad se evalúa por llamada (no se cachea agresivamente). Cambiar la allowlist no requiere invalidación de estado. | Gate se aplica en `find_blocks_by_source_publisher` antes del scan; cada llamada lee fresh la allowlist. | `aether_v03_allowlist_e2e::hiding_remote_publisher_does_not_affect_local_queries` |
+| **R13** | **`PublisherId::LOCAL` siempre visible**, independientemente del modo. `is_publisher_visible(LOCAL)` retorna `true` por short-circuit antes de tocar la allowlist. `Intent::SetPublisherAllowlist` rechaza con `RuntimeError::Other("cannot set allowlist entry for local publisher")` cualquier intento de inscribir LOCAL en la tabla. | `is_publisher_visible` short-circuit + `execute_set_publisher_allowlist` validation | `aether_v03_allowlist_e2e::local_publisher_always_visible_regardless_of_mode`, `protocol::tests::test_set_publisher_allowlist_rejects_local` |
+| **R14** | **`Source.active=false` oculta bloques ortogonalmente.** El flag vive en `Source.active` (default `true`) y se togglea via `Intent::SetSourceActive`. `find_blocks_by_source_publisher` filtra per-block: para cada candidato, lookup `Block → Document → Source` y descarta si `source.active == false`. AND-combina con la allowlist (publisher visible + source activo). | `find_blocks_by_source_publisher` per-block active filter + `execute_set_source_active` handler | `aether_v03_allowlist_e2e::source_active_false_filters_visible_publisher`, `allowlist_and_source_active_compose_with_and`, `protocol::tests::test_set_source_active_toggles_flag` |
+
+**Nota sobre composición R11∧R14:** un block es **visible** si y sólo si `is_publisher_visible(block.publisher_id) ∧ source.active`. Esto da dos kill-switches ortogonales: la allowlist es policy-driven (workspace owner declara con quién se entiende), `Source.active` es UX-driven (usuario silencia un import temporal sin tocar policy). La AND-composition es by-design: hay dos niveles de "no", cualquiera de los dos esconde.
+
+### Lo que NO cambió
+
+- D1-D7 siguen siendo las decisiones rectoras.
+- Wire format v4 (FORMAT_VERSION + hash domain + AetherRelationship fields) idéntico al spec.
+- Composite Block PK `(publisher_id, BlockId)` idéntico al spec.
+- Allowlist, `same_as`, `from_publisher` query filter — todos implementados conforme al spec original.
+
+### Forward-compat note
+
+H1+H3 ya emiten los wire fields `from/to_publisher_id` correctamente; H4 conectó los wire fields al resolver reutilizando la H1 reverse rule (`aether_bind`) como fallback cuando los wire fields llegan `None`. H6/H7 cerraron la query path: el subscriber puede ahora filtrar/auditar/ocultar publishers sin tocar el wire format. No se anticipa wire-impact para Área D (revocación) — los campos `revoked_at` vivirán en storage local, no en el paquete.
