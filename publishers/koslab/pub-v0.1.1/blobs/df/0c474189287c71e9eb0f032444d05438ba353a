@@ -1,0 +1,421 @@
+# Aether — Modelo de Amenazas y Endurecimiento
+
+**Versión:** v0.4.2 · **Estado:** published · **Fecha:** 2026-05-19 · **Área D CLOSED**
+**Scope:** Seguridad del transporte de conocimiento Aether (publish → wire → import) + grafo cross-package + identidad per-slice y cola PendingSlice (Área D / D5) + convergencia intent vs subscribe (D9) + Two-layer invariant (post-D9 shipped, D8 pinned)
+**Trilogía relacionada:**
+- [Aether — Concepto y Principios (v0.1)](workspace://1177a168-7)
+- [Aether — Arquitectura v0 (Camino C: Inside-Out)](workspace://898db881-a)
+- [Aether — Pipeline KOSLAB Dogfooding v0](workspace://4c6d9828-7)
+- [Aether — Hardening v0.2 (Área B: Replay/Downgrade/Versionado)](workspace://9125d9ca-8)
+- [Aether v0.3 — Área C: Grafo Cross-Package, Provenance y Visibility](workspace://751102f2-0)
+- [Aether v0.4 — Área D: Per-Slice Identity & Temporal Pinning](workspace://01a02dea-1)
+
+---
+
+## 0. Changelog
+
+### v0.4.1 → v0.4.2 (esta entrega — Ola 2 polish, Área D CLOSED) — T18 covered + T19 nuevo + Two-layer invariant
+
+Esta entrega cierra documentalmente Área D. Tres ejes:
+
+- **T18 — Intent-path chain validator bypass — promovido 🔴 deuda crítica → 🟢 covered.** D9 shipped (`157a3ef` `feat(runtime): D9 — delegate intent path to chain validator` en branch `feat/aether-v0.4`) materializa el contrato target descrito en §10.3: `Intent::ImportAetherPackage` ahora delega a `verify_slice_chain_v04` ANTES de cualquier escritura; BSV + `slice_root` persisten dentro de gates 8-9; `put_block` + `append_provenance` + `put_relationship` + `enqueue_pending_edge` corren post-validator con allowlist gate intercalado. Ver T18 actualizado en §4.5 y nueva nota en §10.3.
+- **T15 / T16 / T17 — scope promoted `solo subscribe path` → `ambos paths`.** Con la convergencia D9, las mitigaciones (cross-publisher ensure_publisher_id, gate_double_genesis, PendingSlice TTL/cap/FIFO) corren idénticamente desde Intent::ImportAetherPackage y desde ingest_subscribed_slice. Scope notes actualizadas inline en §4.5.
+- **T19 nuevo — Cascade resolve workspace-visibility gap — 🟡 partial (self-healing via Área E subscriber re-pull).** D8 mini-funcional E2E (`d779840`, branch `feat/aether-v0.4`) reveló al pinear el escenario S6 que el cascade resolver (`crates/ckl-aether-client/src/pending_resolver.rs:269`) llama `verify_slice_chain_v04` **directo** sin dispatchear `Intent::ImportAetherPackage` al handler. Consecuencia: cascaded slices land BSV + slice_root (L1 publisher-attested) pero **NO** las Area C writes (L2 workspace-visible) — block, provenance, relationships, pending_edges quedan vacíos. Workspace queries no surface contents hasta que un subscriber re-pull dispare re-import via handler (Área E). Mismo perfil que T17 (mitigación parcial + completa diferida). Ver §4.5 T19 y §10.4 (nueva).
+- **§10.4 nueva — Two-layer invariant — security implications.** Documenta el fact arquitectural load-bearing que sobrevive a la convergencia: Aether persiste en dos capas con invariantes independientes (L1 chain bookkeeping vs L2 workspace-visible). El handler comment de `crates/ckl-runtime/src/protocol.rs:2480-2498` es la fuente canónica. Implicaciones para operadores: ver L1 entries sin L2 contents puede ser estado válido (allowlist deny, cascade resolve post-defer), NO necesariamente attack. Cross-ref a spec `01a02dea-1` §6.9.
+
+Cross-ref: spec `01a02dea-1` v0.4 published (Ola 2) §0.0.2 closure entry + §6.9 Two-layer invariant + §9 ledger D8/D9 shipped.
+
+### v0.4 → v0.4.1 (Ola 1 — bypass descubierto en prep D8) — Bifurcación intent vs subscribe descubierta en prep D8
+
+Durante la preparación del mini-funcional E2E (D8 del spec Área D `01a02dea-1`), una lectura cruzada entre los dos entry points shipped reveló que **existen dos caminos disjuntos para ingerir wire v5 con superficies de seguridad distintas**:
+
+- **Intent path** (`Intent::ImportAetherPackage`, handler `execute_import_aether_package` en `crates/ckl-runtime/src/protocol.rs:2293` → `ckl_aether_client::verify_package` en `crates/ckl-aether-client/src/lib.rs:138-169`): acepta `FORMAT_VERSION=5`, verifica sig chain + cert window + `PublisherCertificate::ensure_publisher_id` a nivel **package**. **No** rutea por `verify_slice_chain_v04`. Escribe `put_block` + `append_provenance` + `put_relationship` + `enqueue_pending_edge`. **No** consulta la allowlist en el handler.
+- **Subscribe path** (`ingest_subscribed_slice` en `crates/ckl-aether-client/src/lib.rs:756`): rutea por `verify_slice_chain_v04` (9 gates, ver spec v0.4 §6.7). Escribe BSV (`try_put_block_slice_version_idempotent`) + `slice_root` (`try_put_slice_root_idempotent`). **No** escribe provenance ni materializa blocks/relationships/pending_edges. **No** consulta la allowlist.
+
+Consecuencias documentadas en esta versión:
+
+- **T15/T16/T17 re-evaluadas con scope explícito.** Las mitigaciones aplican **solo al subscribe path**. Un subscriber que ingiera vía `Intent::ImportAetherPackage` está hoy expuesto a los ataques que el 9-gate validator previene. Notas de scope añadidas inline (§4.5).
+- **T18 nueva — Intent-path chain validator bypass · 🔴 partial/uncovered.** Documenta el bypass del chain validator desde el intent path. Mitigación target: hito de convergencia que delega el intent a `verify_slice_chain_v04` + persiste BSV/`slice_root` además de provenance/blocks/relationships/pending_edges en transacción coherente. Ver §4.5 (T18) y §6 (deferral).
+- **Implicaciones de ship.** Ningún entry point shipped ejerce simultáneamente las tres superficies (chain validator + provenance + allowlist). v0.4 **no debe shippearse a producción** mientras el intent path siga bypassando el validator. La convergencia es prerequisito de D8 (mini-funcional E2E) y de Área E (HTTP transport, que necesita un solo entry point invocable).
+
+Cross-ref: spec Área D `01a02dea-1` §6.8 (estado shipped + target convergencia), §9 D9 (provisional — hito de convergencia, owner sibling session `260514-long-heron`), §0.0.2 DEC-4.
+
+### v0.3 → v0.4 (Área D + D5 shipped)
+
+Este documento sustituye al v0.3 (review 2026-05-13). La novedad de v0.4 es la cobertura de las amenazas habilitadas por Área D (per-slice identity, slice chain Merkle) y el ciclo D5 (PendingSlice queue + resolver BFS), ya shipped en `feat/aether-v0.4` (commits D1..D5 validados).
+
+- **T15 (Cross-publisher impersonation)** — **NUEVA · 🟢 covered.** `PublisherCertificate::ensure_publisher_id(claimed)` enforced vía API obligatoria en `SignedManifest::verify_against_manifest_digest(expected_publisher_id)`. Ver §4.5 y §10.1. Commit `358d407`.
+- **T16 (Genesis replay attack — A1)** — **NUEVA · 🟢 covered.** `gate_double_genesis` (gate 7 del chain validator, ver spec v0.4 §6.7) fires por construcción ante CUALQUIER segundo génesis con misma `(publisher, source)`. Ver §4.5 y §10.2 (INSIGHT H3).
+- **T17 (Pending queue exhaustion)** — **NUEVA · 🟡 partial.** TTL 7d + cap global 10k + FIFO eviction + counter observability cubren el caso base. **Pendiente v0.4.x:** per-source eviction primitive para isolation entre publishers maliciosos vs legítimos. Ver §4.5 y §6 (diferimientos).
+- **T14 (ID collision)** — mitigación ampliada en v0.4: la API `PublisherCertificate::ensure_publisher_id` es la última línea de defensa contra cross-publisher trust drift y está enforced **por firma de función** (parámetro `expected_publisher_id` obligatorio, no puede olvidarse). Ver §4.4 actualizado.
+
+### 0.0 Cambios respecto a v0.2
+
+Este documento sustituye al v0.2 (publicado el 2026-05-09). La novedad de v0.3 es el cierre de **T14 (ID collision)** mediante la implementación de Área C — Grafo cross-package, provenance y visibility:
+
+- **T14 (ID collision)** — pasa de 🟡 partial → 🟢 covered. La clave primaria de `Block` en storage es ahora compuesta `(publisher_id, block_id)`; un paquete remoto y un bloque local con el mismo `id` viven en filas distintas por construcción. El subscriber registra el publisher origen de cada import en un log de provenance (`ProvenanceEntry`) y la query `find_blocks_by_source_publisher` filtra por `publisher_id`. La colisión deja de ser semánticamente posible en el dominio de storage.
+
+### 0.1 Cambios respecto a v0.1 (heredados de v0.2)
+
+- **T4 (Replay)** — 🔴 missing → 🟢 covered. Cursor monotónico por `(root_pk, publisher_id, slice_id)` en `Intent::ImportAetherPackage`.
+- **T5 (Downgrade)** — 🔴 missing → 🟢 covered. `Intent::CheckSliceManifest` + `RuntimeError::DowngradeDetected`.
+- **T12 (Block flood)** — 🟡 partial → 🟢 covered. `MAX_BLOCKS_PER_PACKAGE = 10_000` en `AetherPackage::from_cbor`.
+- **Versionado** — `FORMAT_VERSION` 2 → 3 con `MIN_SUPPORTED_FORMAT_VERSION` y `seq: u64` obligatorio.
+- **Defensa multi-tenant** — cursores por `(root_pk_hex, publisher_id, slice_id)`.
+
+---
+
+## 1. Contexto y alcance
+
+Aether transporta conocimiento entre tenants CKL/KOS independientes a través de un **paquete CBOR firmado**. Desde v0.3:
+
+- **Publisher** exporta vía `export_aether_package(slice, seq)` → `(SignedPackage, AetherPackage)`. Cada slice viene acompañado de un `SliceManifest` firmado para detección de downgrade.
+- **Wire** = filesystem local (tempdir) en v0.1; canal HTTP en v0.2+.
+- **Subscriber** decodifica, verifica firma + cert + digest + ventana, **chequea cursor**, y materializa bloques + relaciones vía `Intent::ImportAetherPackage`. **A partir de v0.3** cada bloque importado se persiste con clave compuesta `(publisher_id, block_id)` y queda registrado en el provenance log; las queries por publisher pasan por un gate de visibilidad (allowlist + `Source.active`).
+
+### 1.1 Fuera de alcance
+
+- Confidencialidad del payload (Aether es **público por diseño**).
+- Auditoría de actividad de subscribers (privacidad de quién consume).
+- Resistencia a censura del canal (responsabilidad del transporte).
+
+---
+
+## 2. Modelo de adversario
+
+| Adversario | Capacidad | Motivación |
+|---|---|---|
+| **MITM pasivo** | Lee el wire | Inteligencia |
+| **MITM activo** | Modifica/sustituye bytes en el wire | Sabotaje, inyección |
+| **Publisher comprometido** | Firma con clave válida pero contenido malicioso | Phishing de conocimiento |
+| **Subscriber malicioso** | Recibe paquete legítimo y lo abusa | DoS sobre sí mismo, exfiltración |
+| **Tercero sin claves** | Crea paquetes y los ofrece como "Aether válido" | Spoofing de fuente |
+| **Operador del canal** | Sirve paquetes viejos o niega los nuevos | Replay/downgrade |
+| **Publisher hostil con id colisivo** | Firma un paquete cuyos `blk_*` chocan con `id`s locales del subscriber | Inyección/secuestro de identidad de bloque |
+
+**Trust anchor en v0.1–v0.3:** una sola **root key** controlada por KOSLAB, que certifica `PublisherCertificate` con TTL.
+
+---
+
+## 3. Activos a proteger
+
+| Activo | Propiedad crítica |
+|---|---|
+| **Integridad del paquete** | Cada byte materializado debe coincidir bit-a-bit con lo que firmó el publisher. |
+| **Autenticidad del publisher** | El subscriber debe poder afirmar "esto viene de KOSLAB, no de un tercero". |
+| **Frescura del paquete** | El subscriber sólo materializa secuencias estrictamente crecientes. |
+| **Disponibilidad del subscriber** | Importar un paquete malicioso no debe tumbar al runtime. |
+| **Aislamiento del workspace** | Un paquete no debe poder escribir fuera del filesystem permitido por CIP. |
+| **Determinismo y aislamiento de IDs** | Los `blk_*` y `rel_aether_*` no colisionan con bloques locales — los namespaces `(publisher_id, block_id)` son disjuntos por construcción. |
+| **Trazabilidad del origen** | Para cada bloque importado, el subscriber puede auditar de qué publisher/slice/seq proviene. |
+
+---
+
+## 4. Catálogo de amenazas (T1-T14)
+
+> **Estado:**
+> - 🟢 **covered** — mitigado en la rama actual (v0.1, v0.2 o v0.3)
+> - 🟡 **partial** — protección parcial; hueco identificado
+> - 🔴 **missing** — sin mitigación
+
+### 4.1 Tampering (alteración del paquete)
+
+| ID | Amenaza | Estado | Mitigación actual | Mitigación faltante |
+|---|---|---|---|---|
+| **T1** | Modificación del payload en tránsito | 🟢 covered | SHA-256 canónico (CBOR domain-separated, dominio v3 en v0.2) verificado contra `SignedPackage.digest` antes de materializar. | — |
+| **T2** | Sustitución total del paquete por uno firmado por root distinta | 🟢 covered | `verify_package` exige que `cert.root_pubkey` coincida con la root anclada en el subscriber. | — |
+| **T3** | Sustitución del `PublisherCertificate` dentro del paquete | 🟢 covered | El digest cubre `cert + payload`; tampering del cert invalida la firma. | — |
+
+### 4.2 Spoofing y suplantación
+
+| ID | Amenaza | Estado | Mitigación actual | Mitigación faltante |
+|---|---|---|---|---|
+| **T4** | **Replay** — el operador del canal sirve un paquete viejo legítimo | 🟢 **covered (v0.2)** | `seq: u64` obligatorio + cursor `(root_pk, publisher, slice) → last_seen`. `Intent::ImportAetherPackage` rechaza con `RuntimeError::ReplayDetected` si `seq <= last_seen`. Tests: `aether_replay_e2e.rs` (4/4) + `aether_two_tenant_e2e.rs`. | — |
+| **T5** | **Downgrade** — operador sirve consistentemente la versión `n-k` | 🟢 **covered (v0.2)** | `SliceManifest` firmado independientemente + `Intent::CheckSliceManifest`. Tests: `aether_downgrade_e2e.rs` (5/5). | — |
+| **T6** | **Compromiso de publisher key** | 🟡 partial | TTL del cert fuerza rotación periódica. | Lista de revocación firmada por root + verificación obligatoria (v0.3 Área D). |
+| **T7** | **Compromiso de root key** | 🔴 missing | — | Trust on first use con pinning + canal out-of-band para rotación de root (v0.3+). |
+| **T8** | **Cert expirado** | 🟢 covered | `verify_package` rechaza si `now > cert.not_after`. | — |
+
+### 4.3 Denial of Service
+
+| ID | Amenaza | Estado | Mitigación actual | Mitigación faltante |
+|---|---|---|---|---|
+| **T9** | **Memory bomb** — paquete CBOR de 10 GB tumba el runtime al deserializar | 🟢 covered | `MAX_PACKAGE_BYTES = 64 MB` chequeado **antes** de `from_reader`; `MAX_MANIFEST_BYTES = 64 KB` para manifests. | — |
+| **T10** | **Path traversal** — `slice="../../../etc/passwd"` o `publisher` con `/` | 🟢 covered | Regex `^[a-z0-9_-]{1,64}$` en `verify_package` y constructor de `SliceManifest`. | — |
+| **T11** | **Depth bomb** — CBOR profundamente anidado agota stack | 🟢 covered | `MAX_NESTING_DEPTH = 32` con `Reader::with_max_depth`. | — |
+| **T12** | **Block flood** — paquete con 10M bloques satura el storage | 🟢 **covered (v0.2)** | `MAX_BLOCKS_PER_PACKAGE = 10_000` enforced en `AetherPackage::from_cbor`. Tests: `from_cbor_rejects_block_flood`, `from_cbor_accepts_max_blocks`. | — |
+
+### 4.4 Phishing de conocimiento
+
+| ID | Amenaza | Estado | Mitigación actual | Mitigación faltante |
+|---|---|---|---|---|
+| **T13** | **Phishing por publisher legítimo comprometido** — KOSLAB firma contenido manipulado | 🔴 missing | — | Doble firma (autor + publisher) + workflow de revisión humana antes de firmar (v0.3+). |
+| **T14** | **ID collision** — `blk_*` del paquete choca con uno local preexistente | 🟢 **covered (v0.3 + reforzada v0.4)** | **Clave primaria compuesta `(publisher_id, block_id)`** en `BlockKey`/`AetherStore` (H1/D1) — un paquete remoto y un bloque local con el mismo `id` viven en filas distintas por construcción, la colisión deja de ser semánticamente posible. **Provenance audit log** (`ProvenanceEntry`, H2) registra el publisher de origen de cada import. **Gate de visibilidad** (`is_publisher_visible` + `find_blocks_by_source_publisher`, H7-A/B/C) garantiza que un publisher hostil bloqueado no aparece en las queries aun habiendo importado bytes legítimos. **v0.4 (commit `358d407`):** la API `PublisherCertificate::ensure_publisher_id(claimed) -> Result<(), SignError::PublisherMismatch>` es la **última línea de defensa** contra cross-publisher trust drift y está enforced por **firma de función** — el parámetro `expected_publisher_id` es obligatorio en `SignedManifest::verify_against_manifest_digest`, no puede olvidarse. Gate order: sig chain → digest match → publisher_id match → not_after. Ambos paths (manifest + package) cubiertos. Tests: `aether_v03_two_publisher_e2e.rs` (composite PK + cross-edge + provenance + visibility), `aether_v03_allowlist_e2e.rs` (8/8), tests v0.4 de cross-publisher impersonation (T15). | — |
+
+### 4.5 Identidad per-slice y cola PendingSlice (Área D / D5, v0.4)
+
+> Sección añadida en v0.4. Cubre las amenazas habilitadas por la elevación de la identidad temporal a eje canónico del wire (Área D) y por la introducción de la cola `PendingSlice` para resolver dependencias diferidas (D5).
+
+| ID | Amenaza | Estado | Mitigación actual | Mitigación faltante |
+|---|---|---|---|---|
+| **T15** | **Cross-publisher impersonation** — atacante usa cert legítima de publisher A para firmar un manifest declarando publisher B | 🟢 **covered (v0.4) — solo subscribe path** | `PublisherCertificate::ensure_publisher_id(claimed)` enforced vía API obligatoria en `SignedManifest::verify_against_manifest_digest(expected_publisher_id)`. **Gate order:** sig chain → digest match → publisher_id match → not_after. Ambos paths (manifest + package) cubiertos a nivel de verificación de package; el chain validator (subscribe path) refuerza la mitigación gate-a-gate. La firma de función obliga al caller a pasar `expected_publisher_id` — no se puede olvidar. Commit `358d407`. **Scope:** este threat aplica al **subscribe path** (`ingest_subscribed_slice`, `crates/ckl-aether-client/src/lib.rs:756`). El **intent path** (`Intent::ImportAetherPackage`, handler `crates/ckl-runtime/src/protocol.rs:2293`) hoy bypassa el chain validator pero **sí** invoca `verify_package`, que ya enforce `ensure_publisher_id` a nivel package — por lo que T15 estricto sobre el package se mantiene 🟢 en ambos paths; los gates de chain de subscribe son adicionales. Ver T18 para la deuda residual del intent path. | — |
+| **T16** | **Genesis replay attack (A1)** — atacante re-emite paquete génesis legítimo para forzar branch divergente o reescritura del génesis | 🟢 **covered (v0.4) — solo subscribe path** | `gate_double_genesis` (gate 7 del `verify_slice_chain_v04`, ver spec v0.4 §6.7) **fires por construcción** ante CUALQUIER segundo génesis con misma `(publisher, source)`, **independiente de byte-equality**. Distinguir A1 (replay-attack) de H3 (retry legítimo) requeriría byte-compare del paquete completo en gate 7 → tampering surface inaceptable. El contrato **NO soporta replay de génesis-con-contenido** — sólo del `slice_root` como única escritura persistida (degenerate H3, ver §10.2). Ver INSIGHT H3 en spec v0.4 §6.7.3. **Scope:** esta mitigación corre **solo en el subscribe path** (`ingest_subscribed_slice`). El **intent path** (`Intent::ImportAetherPackage`) hoy NO invoca `verify_slice_chain_v04` y por tanto NO ejerce `gate_double_genesis` — un subscriber que use el intent path es vulnerable a A1 (replay de génesis con `previous_slice_root=None`/forjado). Ver T18. | — |
+| **T17** | **Pending queue exhaustion** — atacante inunda la cola `PendingSlice` con paquetes huérfanos forjados | 🟡 **partial (v0.4) — solo subscribe path** | TTL **7d** + cap **global 10k** + FIFO eviction + counters de observabilidad (`pending_slice_cascade_capped_total`, `pending_slice_terminal_drop_total`). `PendingSliceId` derivado de identidad (NO payload) → re-enqueue con tamper de payload = **upsert determinista**, no leak ni inflation. **Scope:** la cola `PendingSlice` la alimenta exclusivamente el **subscribe path** (`ingest_subscribed_slice` enqueue en `ChainOrphanPreviousSlice`). El **intent path** (`Intent::ImportAetherPackage`) escribe sobre `aether_pending_edges` (cola distinta, Área C heredada) y no consume `PendingSlice`. T17 no aplica al intent path en su forma actual, pero el intent path queda expuesto al threat correlativo de la cola Área C — fuera de scope de Área D. Ver T18 para la convergencia. | **Pendiente v0.4.x:** primitiva `evict_lru_pending_slices_for_source` (per-source eviction) para aislar publishers maliciosos vs legítimos. Driver natural: Área E cuando T1 Bulk rate-limit requiera quotas per-publisher. Hoy v0.4 ship sólo expone eviction global. |
+| **T18** | **Intent-path chain validator bypass** — un subscriber que usa `Intent::ImportAetherPackage` para ingerir un paquete v5 acepta cualquier slice cuyo manifest pase sig chain + digest + `ensure_publisher_id` + cert window, **sin** ejercer los gates 5-9 del `verify_slice_chain_v04`. Atacante con cert legítima puede forjar `previous_slice_id`/`previous_slice_root` apuntando a `[0u8;32]`, declarar `genesis=true` sobre cadena ya inicializada, o construir un `merkle_proof` inválido — el handler los acepta. | 🟢 **covered (v0.4.2) — D9 shipped** | **Shipped:** D9 (`157a3ef` `feat(runtime): D9 — delegate intent path to chain validator` en branch `feat/aether-v0.4`) — `Intent::ImportAetherPackage` ahora delega a `verify_slice_chain_v04` ANTES de cualquier escritura. Gates 5-9 corren desde el intent path: `previous_slice_root` lookup, merkle proof + leaf cross-check (gates 6a/6b), `gate_double_genesis` (gate 7), BSV + `slice_root` persistencia idempotente (gates 8-9). Handler escribe `put_block` + `append_provenance` + `put_relationship` + `enqueue_pending_edge` post-validator con allowlist gate intercalado (post-validator, pre-Area-C writes — comment load-bearing en `crates/ckl-runtime/src/protocol.rs:2480-2498`). D8 mini-funcional E2E (`d779840`) pinea el comportamiento con 7 escenarios. **Consecuencia para T15/T16/T17:** scope promoted `solo subscribe path` → `ambos paths`. **Consecuencia residual:** Two-layer invariant (§10.4) — L1 (BSV + slice_root) y L2 (block + provenance + relationships) son capas independientes. L2 puede estar vacía mientras L1 persiste — caso (a) allowlist deny es estado válido. Cascade resolve (caso b, ver T19) sigue sin pasar por handler. | — (T18 cerrado; ver T19 para el caso residual de cascade resolve). |
+| **T19** | **Cascade resolve workspace-visibility gap** — un slice `slc_N+1` aterriza en la cola `PendingSlice` (waiting on `slc_N`); al landear `slc_N` el cascade resolver (`crates/ckl-aether-client/src/pending_resolver.rs:269`) llama `verify_slice_chain_v04` directo sobre `slc_N+1` SIN dispatchear `Intent::ImportAetherPackage` al handler de runtime. BSV + `slice_root` de `slc_N+1` persisten (gates 8-9 = L1 publisher-attested), pero `put_block` + `append_provenance` + `put_relationship` + `enqueue_pending_edge` (L2 workspace-visible) NO se ejecutan porque el handler está en un crate distinto (`ckl-runtime` vs `ckl-aether-client`) y el dispatch cross-crate sería acoplamiento inverso al cono de dependencias. Las queries workspace (`find_blocks_by_source_publisher`, reasoner) NO surface el contenido de `slc_N+1` hasta que un subscriber re-pull dispare re-import via intent path. | 🟡 **partial (v0.4.2) — self-healing via Área E** | **Shipped — mitigación parcial:**<br>1. **No es un security gap criptográfico** — L1 SÍ persiste con validación completa (gates 1-9 corren desde el cascade resolver). El attacker no puede inyectar un slice forjado: gate_double_genesis y proof leaf cross-check siguen fires.<br>2. **Estado consistente entre subscribers** — todos los subscribers que reciben el mismo cascade verán el mismo L1 (BSV + slice_root) y la misma L2 gap. No hay divergencia.<br>3. **D8 S6 pinea el comportamiento** (`d779840`) — el escenario es deterministico y testeable.<br>4. **Observable vía diff L1 \ L2** — un operador o herramienta de auditoría puede detectar el gap escaneando `slice_roots::` vs `block` por `(publisher, source)`.<br>**Self-healing path:** Área E subscriber polling pattern. Cuando el subscriber detecte gap (slice_root presente, block ausente para el mismo `(pub, src, blk, slc)`), re-dispara `Intent::ImportAetherPackage` re-importando el paquete desde el mirror (Aether es público, los bytes son los mismos). Handler ejecuta path normal: validator (idempotent en gates 8-9 vía P2 tri-state) + allowlist + L2 writes. L2 ahora pobla. **Consecuencia operativa:** ver L1 entries sin L2 contents puede ser estado válido (cascade gap recoverable, no attack). Ver §10.4. | **Target completo:** cierre del caso (b) del Two-layer invariant — opción A: cascade resolver dispatches `Intent::ImportAetherPackage` via handler (requiere desacoplar dependencia inversa `ckl-aether-client` → `ckl-runtime` — diferido); opción B: cierre sin código nuevo en `pending_resolver` vía Área E subscriber re-pull pattern (probable). **Owner:** Área E. **Backlog item:** BL-1 en spec `01a02dea-1` §13.x. |
+
+---
+
+## 5. Cobertura v0.3 — Área C (Grafo cross-package, Provenance, Visibility)
+
+**Objetivo:** cerrar T14 antes de la merge a `develop`. **Cumplido.**
+
+### 5.1 Resumen de hitos (rama `feat/aether-v0.3`)
+
+| Hito | Cobertura |
+|---|---|
+| **H1 / D1** — Composite `BlockKey { publisher_id, id }` en storage | T14 (estructural) |
+| **H2** — Provenance audit log (`ProvenanceEntry` + `Intent::GetBlockProvenance`) | T14 (trazabilidad) |
+| **H4** — Cross-publisher edge resolver con namespacing por publisher | T14 (relaciones) |
+| **H5** — `same_as` bidirectional contract | T14 (dedupe explícito, opt-in) |
+| **H6 / R8 / R10** — `find_blocks_by_source_publisher` | T14 (query gate) |
+| **H7-A** — `RuntimeConfig.publisher_allowlist_mode` + tabla de allowlist | T14 (policy) |
+| **H7-B** — `Source.active: bool` + `Intent::SetSourceActive` | T14 (kill-switch por source) |
+| **H7-C** — `is_publisher_visible` + gate en `find_blocks_by_source_publisher` | T14 (enforcement) |
+| **H8** — Two-publisher full E2E | T14 (cobertura end-to-end) |
+
+### 5.2 Tests añadidos (todos verdes)
+
+- `crates/ckl-runtime/tests/aether_v03_allowlist_e2e.rs` (8 tests) — Open/Strict × allow/deny/missing, LOCAL siempre visible, `Source.active=false` filtra, AND-composition allowlist ∧ source.active.
+- `crates/ckl-runtime/tests/aether_v03_two_publisher_e2e.rs` (1 test integral) — dos publishers importan blocks con el mismo `blk_id`, rows aisladas, cross-publisher edge resuelto, provenance auditable, visibility gate respetada.
+- `crates/ckl-runtime/src/protocol.rs::tests` — `test_set_source_active_toggles_flag`, `test_set_source_active_missing_source_errors`, `test_set_publisher_allowlist_upserts_row`, `test_set_publisher_allowlist_rejects_local`.
+
+### 5.3 Reglas de visibilidad (sintetizadas, ver spec §15)
+
+- **R11** — Allowlist gates publishers no-LOCAL. Open: visible por defecto, deny-list. Strict: oculto por defecto, allow-list.
+- **R12** — Ocultar un publisher no afecta a otros publishers (gate per-call).
+- **R13** — `PublisherId::LOCAL` siempre visible, independientemente del modo. `Intent::SetPublisherAllowlist` rechaza intentos de inscribir LOCAL.
+- **R14** — `Source.active=false` oculta bloques de ese source ortogonalmente; AND-combina con la allowlist.
+
+---
+
+## 6. Diferimientos a v0.4+
+
+| ID | Hitos v0.4+ | Notas |
+|---|---|---|
+| **T6** | Área D — Robustez de firma | Lista de revocación firmada por root, distribuida por el mismo canal. |
+| **T7** | v0.4+ | Trust pinning + canal out-of-band; no urgente mientras KOSLAB sea trust anchor único. |
+| **T13** | v0.4+ | Doble firma (autor + publisher) + workflow de revisión humana. |
+| **T17** | v0.4.x | Per-source eviction primitive (`evict_lru_pending_slices_for_source`). Hoy v0.4 sólo expone eviction global. |
+| **T18** | ✅ **CLOSED v0.4.2** — D9 shipped (`157a3ef`, branch `feat/aether-v0.4`) | `Intent::ImportAetherPackage` delega a `verify_slice_chain_v04` ANTES de escritura; BSV + `slice_root` persisten en gates 8-9; Area C writes post-validator con allowlist gate intercalado (comment `crates/ckl-runtime/src/protocol.rs:2480-2498`). D8 mini-funcional E2E (`d779840`) pinea con 7 escenarios. Promueve T15/T16/T17 implícitamente a scope `ambos paths` (mismos gates corren). Ver T18 actualizado en §4.5 y §10.3. |
+| **T19** | **Área E** vía subscriber re-pull pattern (probable cierre sin código en `pending_resolver` — cuando el subscriber detecte gap L1-without-L2 vía polling, re-dispara intent path normal e idempotencia de gates 8-9 hace el resto) | Cascade resolve workspace-visibility gap: `pending_resolver.rs:269` llama `verify_slice_chain_v04` directo sin dispatchear Intent al handler de runtime → L1 persiste, L2 vacía. Self-healing parcial hoy (D8 S6 pinea). **Owner:** Área E. **Backlog:** BL-1 en spec `01a02dea-1` §13.x. Alternativa A (cross-crate dispatch directo `ckl-aether-client` → `ckl-runtime`) diferida por acoplamiento inverso al cono de dependencias. |
+
+---
+
+## 7. Diagrama — superficie de ataque y mitigaciones (v0.3)
+
+```mermaid
+graph LR
+  subgraph Publisher
+    PUB[export_aether_package]
+    SIGN[sign_digest]
+    MAN[sign_manifest_digest]
+  end
+
+  subgraph Wire
+    WIRE[(filesystem / HTTP)]
+    MANW[(manifest)]
+  end
+
+  subgraph Subscriber
+    DEC[decode CBOR]
+    VER[verify_package]
+    CUR{cursor<br/>last_seen}
+    IMP[Intent::ImportAetherPackage]
+    CHK[Intent::CheckSliceManifest]
+    PK[(composite PK<br/>publisher_id, block_id)]
+    PROV[(provenance log)]
+    VIS{visibility gate<br/>allowlist ∧ source.active}
+    STO[(storage)]
+  end
+
+  PUB --> SIGN --> WIRE --> DEC --> VER --> CUR --> IMP --> PK --> STO
+  IMP --> PROV
+  PUB --> MAN --> MANW --> CHK --> CUR
+  STO --> VIS
+
+  WIRE -.T1 tamper.-> DEC
+  WIRE -.T4 replay.-> CUR
+  MANW -.T5 downgrade.-> CHK
+  WIRE -.T9 memory bomb.-> DEC
+  WIRE -.T11 depth bomb.-> DEC
+  WIRE -.T10 path traversal.-> VER
+  WIRE -.T12 block flood.-> DEC
+  PUB -.T6 publisher comprometido.-> SIGN
+  PUB -.T7 root comprometida.-> SIGN
+  IMP -.T14 id collision.-> PK
+
+  classDef covered fill:#22c55e22,stroke:#22c55e
+  classDef partial fill:#eab30822,stroke:#eab308
+  classDef missing fill:#ef444422,stroke:#ef4444
+```
+
+---
+
+## 8. Criterios de aceptación (Área C / v0.3)
+
+- [x] T14 marcada 🟢 covered con commits e hitos H1-H8 referenciados.
+- [x] `cargo test -p ckl-runtime --test aether_v03_allowlist_e2e --test aether_v03_two_publisher_e2e` verde (9 tests, 8+1).
+- [x] Suite Aether v0.2 sigue verde (replay 4/4, downgrade 5/5, two-tenant v0.1 2/2, two-tenant v0.2 2/2, import_intent, full_pipeline, dogfood, publish).
+- [x] Spec §15 sincronizada con R11-R14.
+- [ ] PR `feat/aether-v0.3 → develop` con resumen del Área C en la descripción.
+
+---
+
+## 9. No-objetivos (v0.3)
+
+- ❌ Implementar revocación, trust pinning o doble firma — diferidos a v0.4+.
+- ❌ Auditar la privacidad de subscribers — sigue fuera de alcance del documento.
+- ❌ Federación de root keys o transferencia de trust — fuera de scope hasta v0.4+.
+
+---
+
+## 10. Mitigaciones arquitecturales — v0.4 additions
+
+### 10.1 `PublisherCertificate::ensure_publisher_id` como mitigación de T14 y T15
+
+T14 (cross-publisher trust boundary, ID collision) ya estaba marcada 🟢 covered en v0.3 por composite PK + provenance + visibility. **v0.4 añade una última línea de defensa de naturaleza distinta:** la verificación explícita del publisher claim contra el certificado.
+
+- **API:** `PublisherCertificate::ensure_publisher_id(claimed) -> Result<(), SignError::PublisherMismatch>`.
+- **Enforcement:** el parámetro `expected_publisher_id` es **obligatorio por firma de función** en `SignedManifest::verify_against_manifest_digest(expected_publisher_id)` — el compilador exige al caller pasarlo, no puede olvidarse.
+- **Gate order** dentro de la verificación: `sig chain → digest match → publisher_id match → not_after`. El publisher_id match va **antes** del not_after porque un cert expirado de publisher A no debe poder degradar grácilmente a una firma válida para publisher B.
+- **Cobertura:** ambos paths (manifest + package). Es la mitigación canónica de T15 (cross-publisher impersonation) y refuerza T14.
+- **Referencia commit:** `358d407`.
+
+### 10.2 INSIGHT H3 — orden gate 8 → gate 9 como mitigación arquitectural de A1
+
+El design choice del orden de persistencia `gate 8 (BSV) → gate 9 (slice_root)` en `verify_slice_chain_v04`, combinado con `gate_double_genesis` (gate 7) que corre **ANTES** de gate 8, garantiza que **un replay de génesis-con-contenido siempre tropieza con gate 7 y nunca llega a tocar BSV**. Ver spec v0.4 [§6.7](workspace://01a02dea-1).
+
+**El único replay idempotent posible es el degenerate edge case** donde gate 9 persistió pero el caller no recibió OK (H3). Este escenario es:
+
+- **Observable** — el `slice_root` quedó persistido, BSV consistente, ningún byte modificado.
+- **Benigno** — re-emitir la misma firma produce idempotent-replay en gate 9 (P2 tri-state: `idempotent-replay`).
+- **No distinguible de A1 por byte-compare sin tampering surface** — discriminar A1 (replay-attack) de H3 (retry legítimo) requeriría mantener el paquete previo bit-a-bit y compararlo en gate 7, lo cual es inaceptable como superficie.
+
+**Consecuencia de seguridad:** el contrato NO soporta replay de génesis-con-contenido. Cualquier intento de re-emitir un génesis con payload alterado dispara `ChainDuplicateGenesis` (gate 7, terminal no-recoverable). Es **deseado** por diseño.
+
+**Implicación para Área D5 (PendingSlice):** la transición `pending → real` debe hacer cleanup atómico ANTES del import-real para no dejar un PendingSlice con la misma identidad cuando el real entra. El drain shipped respeta este orden (ver spec v0.4 §5.6).
+
+### 10.3 Target post-convergencia — single import path para T18 (v0.4.1, deuda crítica abierta)
+
+**Contrato target (no shipped — sibling session `260514-long-heron`, D9 provisional del spec Área D `01a02dea-1` §9):**
+
+`Intent::ImportAetherPackage` deja de ser un entry point alterno y pasa a ser un **wrapper coherente sobre el chain validator + escritura de provenance/grafo**:
+
+1. **Verificación** — invoca `verify_slice_chain_v04(signed_manifest, manifest, package, store, root_pk, now)` antes de cualquier escritura. Reusa los 9 gates (estructurales 1-4, lookup `previous_slice_root` 5, merkle proof 6a/6b, `gate_double_genesis` 7, persist BSV 8, persist `slice_root` 9). Cualquier error del validator surface tal cual al caller del intent — no se traduce a `RuntimeError::Other` con cadena suelta.
+2. **Persistencia coherente** — sobre `Ok(outcome)` del validator, el handler ejecuta en transacción única:
+   - `put_block` por cada bloque del package (mantiene compat Área C).
+   - `append_provenance` por bloque importado (mantiene `ProvenanceEntry` de T14, R8-R14).
+   - `put_relationship` + `enqueue_pending_edge` (mantiene la cola Área C `aether_pending_edges`).
+   - **BSV + `slice_root`** ya quedaron persistidas dentro de gates 8-9 del validator — el handler NO duplica esa escritura.
+3. **Reglas de visibilidad** — la decisión de integrar `is_publisher_visible` / allowlist gate ANTES de la persistencia queda parqueada para el hito de implementación. Default conservador propuesto: enforce allowlist post-`verify_slice_chain_v04` y pre-`put_block`, para que un publisher denied no contamine ni provenance ni el grafo.
+
+**Razón conceptual:** "firma + cadena es la garantía, no el entry point". Cualquier byte que pase el digest + sig chain + 9 gates es indistinguible del que pasaría vía subscribe; tener dos handlers con superficies distintas viola el principio de single point of trust.
+
+**Criterio de cierre del hito:**
+
+- 100% de los tests E2E de Área D (`aether_v04_*`) verdes sobre **ambos** call sites (`Intent::ImportAetherPackage` directo y `ingest_subscribed_slice`).
+- T15/T16 promueven scope `subscribe path` → scope `ambos` en este documento (próximo bump v0.4.2).
+- T18 promueve 🔴 partial → 🟢 covered.
+- D8 (mini-funcional E2E) puede ejecutar contra el intent path.
+
+---
+
+### 10.4 Two-layer invariant — security implications (v0.4.2, post-D9 shipped)
+
+> Sección añadida en v0.4.2 (Ola 2 polish) para capturar las implicaciones de seguridad del **fact arquitectural load-bearing** que sobrevive a la convergencia D9. Spec `01a02dea-1` §6.9 desarrolla el invariante como contrato arquitectural; aquí se lo aborda desde el ángulo de threat model: qué ataque es real, qué no, y cómo debe interpretarlo el operador.
+
+#### 10.4.1 El invariante
+
+Aether persiste el resultado de cada ingesta en **dos capas con invariantes independientes**:
+
+- **L1 — Publisher-attested chain bookkeeping:** `BlockSliceVersion` (BSV, §4.2 del spec) + `slice_root` (§4.6). Persistido por gates 8 y 9 del chain validator. **Persiste si el validator pasa, independiente de allowlist y de Area C writes.**
+- **L2 — Workspace-visible state:** `Block` + `ProvenanceEntry` + `Relationship` + `PendingEdge`. Persistido por el handler `execute_import_aether_package` post-validator. **Persiste si el validator pasa AND allowlist permite AND handler dispatcha (path normal, no cascade resolve).**
+
+L2 puede estar **vacía** para una identidad `(publisher, source, entity, slice)` mientras L1 **sí tiene entradas** para esa misma identidad. **Esto es estado válido, no necesariamente attack.**
+
+#### 10.4.2 Evidence-text (handler comment load-bearing)
+
+La fuente canónica del invariante es `crates/ckl-runtime/src/protocol.rs:2480-2498`. Cita:
+
+> ```rust
+> // 5. ALLOWLIST GATE (§10.3 default — post-validator, pre-put_block).
+> //    `is_publisher_visible` honours `publisher_allowlist_mode`
+> //    (Open vs Strict) and the H7-C row; LOCAL is bypassed by R13.
+> //    The validator gates already persisted BSV + slice_root
+> //    (gates 8-9) by the time we get here — those are
+> //    *publisher-attested* bookkeeping, not workspace-visible
+> //    block state. The allowlist guards admission into the local
+> //    graph (put_block / append_provenance / put_relationship),
+> //    which is the operator-facing surface.
+> ```
+
+Lo decisivo: la distinción "*publisher-attested* bookkeeping" vs "workspace-visible block state" nombra las dos capas y explica por qué no pueden colapsarse en un solo write.
+
+#### 10.4.3 Catálogo de casos — cuándo L2 está vacía mientras L1 tiene entradas
+
+**(a) Allowlist deny post-validator** *(D8 S4 lo pinea como test E2E shipped, `d779840`)*
+
+Subscriber recibe paquete v5 vía `Intent::ImportAetherPackage`. Validator pasa los 9 gates → L1 persiste. Handler invoca `is_publisher_visible` → `false`. Handler retorna error ("BSV + slice_root persisted (publisher-attested), but Area C writes refused"). L2 vacía.
+
+- **Tipo de threat:** ninguno — comportamiento de policy deseado.
+- **Cómo lo interpreta un operador con auditoría:** "publisher X intentó importar, firma legítima, no está en allowlist; tengo chain bookkeeping para auditoría, no contamino mi grafo".
+- **Mitigación si el operador quiere ingerirlo:** modificar allowlist (mover X a allow-list) y disparar re-import. Idempotencia de gates 8-9 garantiza no double-write en L1; handler ejecuta L2 writes normales.
+
+**(b) Cascade resolve post-defer** *(D8 S6 lo pinea, `d779840`)*
+
+`pending_resolver.rs:269` llama `verify_slice_chain_v04` directo sin dispatchear Intent al handler. L1 persiste para el cascaded slice; L2 no se escribe porque el handler no se invocó. Workspace queries no surface el contenido.
+
+- **Tipo de threat:** ver T19 — 🟡 partial.
+- **Self-healing path:** Área E subscriber polling re-dispara intent path → L2 pobla.
+- **Diferencia con (a):** en (a) el operador eligió no admitir; en (b) la admisión es deseada pero el cross-crate dispatch fue diferido. Operativamente: (a) requiere acción de operador; (b) se resuelve solo cuando Área E aterrice.
+
+**(c) Rate-limit per-publisher drop (futuro, Área E)**
+
+Si Área E aplica rate-limit **post-validator y pre-Area-C** (defense in depth), un slice puede tener L1 escrito y L2 dropped por quota. Mismo perfil que (a). Si Área E aplica pre-validator, L1 tampoco se escribe (caso normal de "rejected at admission"). Decisión final del placement la cierra Área E.
+
+- **Tipo de threat:** placement-dependiente. Si post-validator, cubre T19-like gap.
+
+#### 10.4.4 Implicación operativa — cómo distinguir gap válido de attack
+
+| Síntoma observado | Interpretación canónica | Verificación |
+|---|---|---|
+| L1 entry presente, L2 entry ausente para mismo `(pub, src, blk, slc)` | Caso válido (a/b/c) | Cross-check `pending_slice_terminal_drop_total` counter + allowlist log + cascade audit trail |
+| L1 entry presente con `previous_slice_root` apuntando a root inexistente en `slice_roots::` | **Attack** — `ChainOrphanPreviousSlice` debería haber fired; si llegó a persist L1, regresión del validator. **Alerta.** | Run `verify_slice_chain_v04` retroactivamente sobre el slice; si pasa hoy pero `previous_slice_root` no resuelve, hay storage corruption — investigar backend integrity. |
+| L1 entry con `genesis=true` mientras ya existe otro `genesis=true` para misma `(publisher, source)` | **Attack T16** — `gate_double_genesis` debería haber fired; regresión del validator. **Alerta crítica.** | Backend storage audit: posible byte-level tampering del namespace `slice_roots::`. |
+| L2 entry presente, L1 entry ausente | **Anomalía** — handler escribió L2 sin validator passing. Regresión del intent path (D9 inverso). **Alerta.** | Recompute BSV + slice_root del block en cuestión; si computables, restaurar L1; investigar por qué el path saltó al validator. |
+
+**Regla canónica de auditoría:**
+
+- **L1 sin L2** = revisar contra catálogo (a)(b)(c). Si encaja, es estado válido.
+- **L2 sin L1** = siempre anomalía. Investigar.
+- **L1 con `previous_slice_root` no resoluble** = siempre attack o regresión.
+
+#### 10.4.5 Por qué el invariante es deliberado (no bug)
+
+Una alternativa hipotética sería **colapsar las dos capas**: hacer que L1 writes (gates 8-9) sean condicionales a L2 writes pasar. Esto rompería tres propiedades:
+
+1. **Auditabilidad criptográfica desacoplada de policy.** Hoy un operador puede auditar "qué firmó publisher P para source S, ¿incluso si decidí no incorporarlo a mi grafo?". Si L1 dependiera de L2, perdería este audit trail para publishers deny-listed.
+2. **Idempotencia cascade-safe.** El cascade resolver puede correr el validator sin necesidad de cargar el contexto del handler (allowlist config, runtime state). Si L1 dependiera de L2, cascade requeriría dispatch via runtime — cross-crate coupling inverso (ver BL-1 en spec backlog).
+3. **Self-healing por re-import.** El path de recovery operacional (operator flip allowlist + re-import) funciona porque L1 ya está poblado idempotentemente — el re-import sólo activa L2 writes. Si L1 dependiera de L2, re-import sería un full re-validate desde cero, costoso y abriría ventana de race conditions.
+
+El invariante **es load-bearing**. Documentar es la mitigación correcta; intentar colapsar las capas sería regresión arquitectural.
+
+Cross-ref:
+- Spec `01a02dea-1` §6.9 (Two-layer invariant — contrato arquitectural completo)
+- T19 en §4.5 (cascade resolve workspace-visibility gap — la amenaza concreta)
+- BL-1 en spec `01a02dea-1` §13.x (cascade resolver dispatch via handler — backlog Área E)
+
+---
+
+**Próximo paso:** v0.4.2 published. PR `feat/aether-v0.4 → develop` con resumen del Área D (T15/T16/T17 🟢/🟡 covered, T18 🟢 covered post-D9, T19 🟡 partial self-healing via Área E, Two-layer invariant documentado §10.4 + spec `01a02dea-1` §6.9). Ship a producción ya no bloqueado por T18 (D9 shipped); ship sí condicionado a Área E aterrizando el subscriber re-pull pattern para cerrar T19.

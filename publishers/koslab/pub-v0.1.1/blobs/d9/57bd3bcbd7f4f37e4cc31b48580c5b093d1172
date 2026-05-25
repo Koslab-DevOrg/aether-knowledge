@@ -1,0 +1,169 @@
+# Aether v0.2 — Área B: Replay, Downgrade y Versionado
+
+**Versión:** v0.2 · **Estado:** draft · **Fecha:** 2026-05-09
+**Branch:** `feat/aether-v0.2`
+**Trilogía v0.1 (referencia):**
+- [Concepto y Principios](workspace://1177a168-7)
+- [Arquitectura v0 Camino C](workspace://898db881-a)
+- [Pipeline KOSLAB Dogfooding](workspace://4c6d9828-7)
+- [Modelo de Amenazas y Endurecimiento](workspace://bf6f5e35-d)
+
+---
+
+## 1. Contexto
+
+Aether v0.1 cerró con: pipeline completo (export → wire fs → verify → import), hardening pass T9/T10/T11, dogfood con la trilogía real, PR #98 mergeado a `develop` (commit `e85cf0b`).
+
+v0.2 ataca **Área B** del threat model — las amenazas que un operador del canal puede explotar **una vez Aether sale al wire HTTP**:
+
+| ID | Amenaza | Estado v0.1 | Cierre v0.2 |
+|---|---|---|---|
+| **T4** | Replay (paquete viejo legítimo servido por canal hostil) | 🔴 missing | 🟢 covered |
+| **T5** | Downgrade (canal sirve consistentemente versión `n-k`) | 🔴 missing | 🟢 covered |
+| **T12** | Block flood (paquete con N millones de bloques) | 🟡 partial (acotado por `MAX_PACKAGE_BYTES`) | 🟢 covered |
+
+El wire HTTP real (GitHub Pages) se difiere a una rama posterior dentro de v0.2 — primero cerramos las invariantes que **dependen del paquete**, no del transporte.
+
+## 2. Decisiones clave
+
+### 2.1 Versionado del wire format — bump duro
+
+Decisión: añadir `package_version: u8` al envelope (`AetherPackage`) y rechazar `package_version < 2` con error `UnsupportedVersion { got, expected_min }`.
+
+Justificación:
+- No hay clientes v0.1 desplegados — Aether v0.1 nunca salió al wire HTTP, sólo vive en CI/dogfood.
+- Un solo code path de decode → menos bugs sutiles, mensajes de error claros (vs. fallo de digest engañoso).
+- Formaliza el handle de versionado para futuros bumps (v0.3 → v0.4 podrá optar por compat backward si en su momento hay producción).
+
+Costo: paquetes v0.1 archivados (los del E2E dogfood) requieren el binario v0.1 para verificarse. Aceptable.
+
+### 2.2 Cursor monotónico y manifest separado
+
+`AetherPackage` gana `seq: u64` — secuencia monotónica por `(publisher, slice)`.
+
+`SliceManifest` es una estructura **independiente**, también firmada por el publisher, que enumera `latest_seq` para cada slice. Esto permite:
+
+- **T4 (replay):** subscriber persiste `last_seen_seq` por `(root_pubkey, publisher, slice)`. Si `incoming.seq <= last_seen` → `ReplayDetected`.
+- **T5 (downgrade):** subscriber consulta el manifest periódicamente. Si `manifest.latest_seq < last_seen_seq` (o no avanza en X tiempo) → `DowngradeDetected` o alerta.
+
+El manifest vive **en el wire** junto a los paquetes. Su firma usa el mismo `PublisherCertificate` que los paquetes — no introduce trust anchor nuevo.
+
+### 2.3 Límite explícito de bloques
+
+`MAX_BLOCKS_PER_PACKAGE = 10_000` — chequeo después del decode CBOR pero antes del import. Variant `BlockCountExceeded { count, limit }`. Calibrado contra el dogfood real (3 bloques por paquete; 10K es ~3.000× de margen).
+
+Razón para no compartir constante con `MAX_PACKAGE_BYTES`: bytes y bloques tienen vectores de ataque distintos — un atacante puede inflar bytes con metadata por bloque, o inflar bloques con cuerpos vacíos. Dos límites independientes cubren ambas direcciones.
+
+## 3. Hitos H1..H6
+
+```mermaid
+graph LR
+  H1[H1 T12<br/>MAX_BLOCKS] --> H2
+  H2[H2 envelope<br/>package_version+seq] --> H3
+  H3[H3 SliceManifest<br/>firmado] --> H4
+  H4[H4 cursor<br/>last_seen_seq] --> H5
+  H5[H5 downgrade<br/>detection] --> H6
+  H6[H6 two-tenant E2E<br/>replay+downgrade]
+```
+
+### H1 — `MAX_BLOCKS_PER_PACKAGE` (T12)
+
+- Constante en `ckl-aether-format` junto a `MAX_PACKAGE_BYTES` y `MAX_NESTING_DEPTH`.
+- Variant `FormatError::BlockCountExceeded { count, limit }`.
+- Chequeo en `AetherPackage::from_cbor` después del decode.
+- Tests: rechaza paquete con 10_001 bloques; acepta paquete con 9_999 bloques; dogfood E2E sigue verde con sus 3 bloques.
+
+### H2 — Envelope versioning + `seq` (versionado duro)
+
+- Añadir `package_version: u8` y `seq: u64` a `AetherPackage`.
+- `from_cbor` rechaza si `package_version < 2` → `UnsupportedVersion { got, expected_min }`.
+- `export_aether_package` toma `seq: u64` como argumento, escribe `package_version=2`.
+- Tests existentes adaptados con `seq=1` por default.
+- Tests nuevos: rechaza paquete con `package_version=1`; rechaza paquete sin el campo (forma vieja).
+
+### H3 — `SliceManifest` firmado
+
+- Nueva struct en `ckl-aether-format` (o módulo dedicado):
+  ```
+  SliceManifest {
+    publisher: String,
+    slice_id: String,
+    latest_seq: u64,
+    generated_at: i64,
+    not_after: i64,
+  }
+  ```
+- Canónico vía CBOR domain-separated, mismo patrón que `AetherPackage`.
+- Sign helper en `ckl-aether-sign`: `sign_manifest(&publisher_keypair, &cert, manifest)`.
+- Verify helper: `verify_manifest(&signed_manifest, &root_pubkey, now)` — mismas reglas que `verify_package`.
+- Tests: roundtrip + tamper detection.
+
+### H4 — Cursor `last_seen_seq` + replay detection (T4)
+
+- Storage layer (`ckl-store`): añadir mapa `aether_cursors: (root_pubkey, publisher, slice_id) → u64`.
+- `Intent::ImportAetherPackage` consulta cursor antes de materializar.
+- Si `incoming.seq <= last_seen` → reject con `RuntimeError::ReplayDetected { incoming, last_seen }`.
+- Si pasa → actualiza cursor a `incoming.seq` **dentro de la misma transacción** que materializa los bloques.
+- Tests: import de seq=1 OK, import de seq=2 OK, import de seq=1 reject (replay), import de seq=2 idempotente reject (replay).
+
+### H5 — Downgrade detection vía manifest (T5)
+
+- Nuevo `Intent::CheckSliceManifest { signed_manifest }` (o helper expuesto).
+- Compara `manifest.latest_seq` vs cursor local `last_seen_seq`.
+- Si `manifest.latest_seq < last_seen_seq` → `DowngradeDetected { manifest_seq, last_seen }`.
+- Si igual o mayor → OK (informativo; el subscriber sabe qué seq esperar).
+- Tests: manifest fresco OK; manifest retrocedido reject.
+
+### H6 — E2E two-tenant: replay + downgrade
+
+- Nuevo test `aether_replay_downgrade_e2e.rs` en `ckl-runtime`.
+- Publisher exporta paquetes seq=1, seq=2, seq=3.
+- Subscriber importa 1, 2, 3 — todo OK.
+- Subscriber recibe seq=2 de nuevo (replay) → reject con `ReplayDetected`.
+- Publisher genera manifest `latest_seq=3`. Subscriber verifica → OK.
+- Adversario sirve manifest forjado (firmado por una root distinta) → reject por verify_manifest.
+- Adversario sirve manifest viejo `latest_seq=1` → reject por `DowngradeDetected`.
+
+## 4. Commits atómicos esperados
+
+1. `feat(aether-format): cap blocks per package at 10_000 (T12)`
+2. `feat(aether-format): introduce package_version=2 + seq u64 (hard bump)`
+3. `feat(aether-format,aether-sign): SliceManifest signed envelope`
+4. `feat(runtime): aether_cursors store + replay rejection in import (T4)`
+5. `feat(runtime): manifest-based downgrade detection (T5)`
+6. `test(runtime): aether v0.2 replay + downgrade two-tenant E2E`
+
+## 5. Criterios de aceptación
+
+- [ ] Branch `feat/aether-v0.2` creada desde `develop@e85cf0b`.
+- [ ] Doc de arranque (este) publicado.
+- [ ] Hitos H1..H6 con tests verdes en sus respectivos crates.
+- [ ] Dogfood E2E v0.1 sigue verde (con `seq=1` y `package_version=2`).
+- [ ] Threat model `bf6f5e35-d` actualizado: T4/T5/T12 → 🟢 covered.
+- [ ] PR `feat/aether-v0.2 → develop` con resumen Área B.
+
+## 6. No-objetivos (explícitos)
+
+- ❌ **Wire HTTP real** — diferido a un PR posterior dentro de v0.2 (Área B + transporte HTTP no son el mismo PR; mantener foco).
+- ❌ **Pipeline GitHub Action** — diferido junto al wire HTTP. Antes de automatizar el push, los paquetes deben tener cursor + manifest funcionando.
+- ❌ **Revocación (T6)** — Área D, v0.3.
+- ❌ **Namespacing cross-package (T13/T14)** — Área C, v0.3.
+
+## 7. Plan de ejecución
+
+```mermaid
+graph LR
+  A[Branch+Doc] --> H1
+  H1 --> H2
+  H2 --> H3
+  H3 --> H4
+  H4 --> H5
+  H5 --> H6
+  H6 --> TM[Bump threat model]
+  TM --> PR[PR feat/aether-v0.2 → develop]
+  PR --> NEXT[v0.2 next: HTTP wire + pipeline]
+```
+
+---
+
+**Próximo paso:** H1 — `MAX_BLOCKS_PER_PACKAGE` en `ckl-aether-format`.
