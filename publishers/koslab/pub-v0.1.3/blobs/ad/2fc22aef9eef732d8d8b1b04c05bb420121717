@@ -1,0 +1,562 @@
+# Aether — Arquitectura v0 (Camino C: Inside-Out)
+
+> **Documento técnico** que aterriza el concepto de Aether (ver Doc #1: *Aether — Concepto y Principios de Diseño v0.1*) en una secuencia de 5 hitos implementables sobre el CKL existente. Cada hito es independiente, testeable y entrega valor incremental.
+
+---
+
+## 0. Punto de partida
+
+### 0.1 Lo que ya existe en CKL (no tocamos)
+
+| Pieza | Crate | Estado |
+|---|---|---|
+| `TemporalSlicer` con Merkle hash chaining | `ckl-temporal` | Estable |
+| `GraduationEngine` con dedup + nutrient + Provenance | `ckl-temporal` | Estable |
+| `KronosSlice` v2 con `blob_oid` CAS | `ckl-types` | Estable |
+| Atomos first-class (`atm_*`) con `holder` y `container` | `ckl-types` | Estable |
+| `EntityState.project: Option<ProjectId>` | `ckl-types` | Estable (ADR v0.4.5) |
+| CIP Gateway Policy v0.2.0 (sealed writes vía IntentEngine) | `ckl-core` | Estable |
+| `PersistentCausalEdge` con `EdgeStatus` | `ckl-types` | Estable |
+| `Layer` enum con `Deprecated` | `ckl-types` | Estable |
+
+### 0.2 Estrategia: Camino C (Inside-Out)
+
+```mermaid
+graph LR
+    H1[H1: Graduación local<br/>session→aether_entity] --> H2[H2: Firma + Intent<br/>PublishToAether]
+    H2 --> H3[H3: Formato canónico +<br/>canal estático]
+    H3 --> H4[H4: ckl-aether-client<br/>cache + verify]
+    H4 --> H5[H5: PUBLISHED_TO_AETHER<br/>relación + queries]
+```
+
+**Por qué**: cada hito ejercita capas **adentro hacia afuera** — primero la lógica core (graduación), luego seguridad (firma), luego transporte (formato/canal), luego consumo (client), luego grafo (relaciones). Permite cortar el alcance en cualquier punto y aún tener algo funcional.
+
+---
+
+## 1. Decisiones técnicas cerradas
+
+| ID | Decisión | Resolución |
+|----|----------|-----------|
+| **D1** | Scope de `aether_entity` | **Source + KronosEntity bound 1:1** |
+| **D2** | Asimetría publisher/consumer | Publisher: dentro de Project · Consumer: `project = None` |
+| **D3** | Binding Source↔Entity | **Campo first-class `Source.entity_id: Option<EntityId>`** |
+| **Q1** | Cómo se setea `entity_id` | **Desacoplado** vía `Intent::BindSourceToEntity` |
+| **Q2** | Quién crea el `aether_entity` | **Implícito**: `SourceKind::Aether` auto-crea su entity |
+
+### 1.1 Modelo mental
+
+```mermaid
+graph TB
+    subgraph PUB["PUBLISHER (KOSLAB)"]
+        Proj[Project: aether-publications<br/>org_id: koslab]
+        Proj --> S1[Source react<br/>kind: Aether<br/>entity_id: ent_xxx]
+        Proj --> S2[Source postgres<br/>kind: Aether<br/>entity_id: ent_yyy]
+        S1 -.bound 1:1.-> E1[Entity react<br/>project: aether-publications<br/>slices: s1, s2, s3...]
+        S2 -.bound 1:1.-> E2[Entity postgres<br/>project: aether-publications<br/>slices: s1, s2...]
+    end
+
+    subgraph CONS["CONSUMER (workspace cualquiera)"]
+        SC1[Source react<br/>kind: Aether<br/>entity_id: ent_xxx]
+        SC1 -.bound 1:1.-> EC1[Entity react<br/>project: None<br/>slices: cached]
+        UProj[Project: my-app] -.PUBLISHED_TO_AETHER.-> SC1
+    end
+
+    E1 ==replicate==> EC1
+```
+
+**Invariante**: `Source.kind == Aether ⟹ Source.entity_id.is_some()` (enforced por IntentEngine).
+
+---
+
+## 2. Hito 1 — Graduación local hacia `aether_entity`
+
+> **Goal**: Que un block pase de `session_entity` a `aether_entity` usando 100% el pipeline de graduación existente. Cero red, cero firma, cero formato canónico.
+
+### 2.1 Cambios de tipo
+
+**`ckl-types/src/source.rs`**:
+```rust
+pub struct Source {
+    pub id: SourceId,
+    pub project_id: Option<ProjectId>,
+    pub kind: SourceKind,
+    pub name: String,
+    pub entity_id: Option<EntityId>,   // NUEVO
+    pub metadata: serde_json::Value,
+    // ...
+}
+
+pub enum SourceKind {
+    Url,
+    Path,
+    Git,
+    Context,
+    Aether,                              // NUEVO
+}
+```
+
+**`ckl-types/src/kronos.rs`**:
+```rust
+pub enum GraduationReason {
+    SessionMaturity,
+    Reinforcement,
+    AdvisoryAccepted,
+    PublishedToAether,                   // NUEVO
+}
+```
+
+### 2.2 Nuevos Intents
+
+```rust
+// En ckl-runtime/src/intent.rs
+pub enum Intent {
+    // ... existing variants ...
+
+    CreateAetherEntity {                 // NUEVO (interno; auto-llamado por UpsertSource)
+        name: String,
+        publisher: PublisherId,
+        layer_init: Layer,
+    },
+
+    BindSourceToEntity {                 // NUEVO
+        source_id: SourceId,
+        entity_id: EntityId,
+    },
+
+    PublishToAether {                    // NUEVO (placeholder en H1; activo en H2)
+        block_id: BlockId,
+        source_session: EntityId,
+        aether_source: SourceId,
+        gate: GraduationGate,
+    },
+}
+```
+
+### 2.3 Nuevo método en `GraduationEngine`
+
+**`ckl-temporal/src/graduation.rs`**:
+```rust
+impl GraduationEngine {
+    pub fn publish_to_aether(
+        &self,
+        block_id: BlockId,
+        source_session: EntityId,
+        aether_source: SourceId,
+        gate: GraduationGate,
+    ) -> Result<GraduationOutcome> {
+        // 1. Resolver target entity
+        let aether_entity = self.resolve_aether_entity(aether_source)?
+            .ok_or(Error::SourceNotBoundToEntity)?;
+
+        // 2. Reusar pipeline existente con reason específico
+        self.graduate_with_reason(
+            block_id,
+            source_session,
+            aether_entity,
+            gate,
+            GraduationReason::PublishedToAether,
+        )
+    }
+
+    fn resolve_aether_entity(&self, source_id: SourceId) -> Result<Option<EntityId>> {
+        let source = self.storage.get_source(source_id)?;
+        Ok(source.entity_id)
+    }
+}
+```
+
+### 2.4 Sub-tareas
+
+| # | Tarea | Crate | Esfuerzo |
+|---|---|---|---|
+| S1.1 | Añadir `Source.entity_id` + `SourceKind::Aether` | `ckl-types` | XS |
+| S1.2 | Migración schema + `StoragePort::get_source_by_entity` | `ckl-store` | S |
+| S1.3 | Implementar 3 Intents nuevos en IntentEngine | `ckl-runtime` | M |
+| S1.4 | Auto-creación de entity en `UpsertSource { kind: Aether }` | `ckl-runtime` | S |
+| S1.5 | `publish_to_aether` + `GraduationReason::PublishedToAether` | `ckl-temporal` | M |
+| S1.6 | Test E2E local con dedup verificado | `ckl-temporal/tests` | S |
+
+### 2.5 Criterio de aceptación
+
+```rust
+#[test]
+fn publish_to_aether_local_with_dedup() {
+    let workspace = TestWorkspace::new();
+
+    // Setup publisher: project + aether source (auto-bind entity)
+    let project = workspace.create_project("aether-pubs");
+    let source = workspace.execute(Intent::UpsertSource {
+        name: "react", kind: SourceKind::Aether,
+        project_id: Some(project), entity_id: None,
+    }).unwrap();
+    let aether_entity = workspace.get_source(source).entity_id.unwrap();
+
+    // Sesión con un block + 3 atomos
+    let session = workspace.create_session_entity();
+    let block = workspace.add_block(session, vec!["fact1", "fact2", "fact3"]);
+
+    // PRIMER publish → atomos novel, todos a Layer::Low
+    let outcome1 = workspace.publish_to_aether(block, session, source, gate());
+    assert!(matches!(outcome1, GraduationOutcome::Graduated { .. }));
+    assert_eq!(workspace.atom_count(aether_entity), 3);
+
+    // SEGUNDO publish del mismo block → todos los atomos hacen match → Reinforced
+    let outcome2 = workspace.publish_to_aether(block, session, source, gate());
+    assert!(matches!(outcome2, GraduationOutcome::Reinforced { .. }));
+    assert_eq!(workspace.atom_count(aether_entity), 3);  // sin duplicar
+
+    // GraduationRecord persistido con reason correcto
+    let records = workspace.records_by_entity(aether_entity);
+    assert!(records.iter().all(|r|
+        matches!(r.provenance.reason, GraduationReason::PublishedToAether)
+    ));
+
+    // El aether_entity puede emitir un slice válido
+    let slice = workspace.commit_slice(aether_entity, "first publish").unwrap();
+    assert_eq!(slice.hash_version, 2);
+    workspace.verify_slice(slice).unwrap();
+}
+```
+
+---
+
+## 3. Hito 2 — Firma + `Intent::PublishToAether` activo
+
+> **Goal**: Que cada publicación quede firmada criptográficamente por el publisher. Sin firma, no se puede confiar en transporte (H3) ni cache (H4).
+
+> **🔄 IMPLEMENTADO (v0.1) — modelo de claves de dos niveles.** El crate `ckl-aether-sign` implementa un modelo **Root ↔ Publisher** con certificados con TTL en lugar del `PublisherKey` único + `TrustAnchor` enum descritos abajo:
+> - `RootKeyPair::certify(publisher_id, publisher_pk, not_before, not_after)` emite un `PublisherCertificate` firmado por la root.
+> - `PublisherKeyPair::sign_digest(cert, digest, signed_at)` produce un `SignedPackage { cert, digest, signed_at, publisher_signature }`.
+> - `verify_package(...)` chequea (1) cert válido bajo la root, (2) `signed_at ∈ [not_before, not_after]`, (3) firma del digest válida bajo el publisher pk certificado, (4) digest matches `package.canonical_hash()`.
+>
+> La firma es **sobre `AetherPackage::canonical_hash()`** (envelope completo, ver §4) — no sobre `slice.hash` directamente. Esto cubre publisher_id + source_id + slice_id + state_hash + ready_marker + blocks + relationships en un solo digest determinístico.
+>
+> **⏭ DIFERIDO a v0.2:** `TrustAnchor` enum (multi-anchor / KMS), revocación, rotación de claves, `SignedSlice` como tipo persistido (en v0.1 la firma vive en el envelope `SignedPackage`, no como columna separada del `KronosSlice`).
+
+### 3.1 Modelo de firma
+
+```mermaid
+sequenceDiagram
+    participant Pub as Publisher (KOSLAB)
+    participant IE as IntentEngine
+    participant GE as GraduationEngine
+    participant TS as TemporalSlicer
+    participant Sig as Signer
+
+    Pub->>IE: Intent::PublishToAether { block, ... }
+    IE->>GE: publish_to_aether(...)
+    GE-->>IE: GraduationOutcome (atomos copiados)
+    IE->>TS: commit_slice(aether_entity, trigger)
+    TS-->>IE: KronosSlice { hash, atoms... }
+    IE->>Sig: sign(slice.hash, publisher_key)
+    Sig-->>IE: Signature(ed25519)
+    IE->>IE: persist SignedSlice { slice, signature, publisher_id }
+```
+
+### 3.2 Nuevos tipos
+
+```rust
+pub struct PublisherId(String);   // ej: "koslab"
+
+pub struct SignedSlice {
+    pub slice: KronosSlice,
+    pub publisher_id: PublisherId,
+    pub signature: Signature,           // ed25519 sobre slice.hash
+    pub signed_at: DateTime<Utc>,
+}
+
+pub struct PublisherKey {
+    pub id: PublisherId,
+    pub public_key: PublicKey,           // VerifyingKey
+    pub trust_anchor: TrustAnchor,       // Local | Manual | KoslabRoot
+}
+```
+
+### 3.3 Sub-tareas
+
+| # | Tarea | Crate | Esfuerzo |
+|---|---|---|---|
+| S2.1 | Crate nuevo `ckl-aether-sign` con keypair management | `ckl-aether-sign` | M |
+| S2.2 | `SignedSlice` + persistencia | `ckl-types` + `ckl-store` | S |
+| S2.3 | Hook en IntentEngine: post-commit auto-sign | `ckl-runtime` | S |
+| S2.4 | `PublisherKey` registry (local trust store) | `ckl-aether-sign` | M |
+| S2.5 | Tests: verify signature, tampered slice rejected | `ckl-aether-sign/tests` | S |
+
+### 3.4 Criterio de aceptación
+
+- Cada `publish_to_aether` persiste un `SignedSlice` válido.
+- `verify(SignedSlice, publisher_key)` retorna `Ok` para slice intacto.
+- Mutar 1 byte en cualquier atom hace que `verify` falle.
+- Verificar con clave equivocada falla.
+
+---
+
+## 4. Hito 3 — Formato canónico + canal estático
+
+> **Goal**: Una `SignedSlice` debe poder serializarse a un blob estable que cualquier CKL pueda leer. Canal estático = un solo bucket S3 / dir gitops, sin protocolo de descubrimiento todavía.
+
+> **🔄 IMPLEMENTADO (v0.1) — envelope CBOR único.** El crate `ckl-aether-format` define un envelope autocontenido `AetherPackage` (publisher_id + source_id + entity_id + slice_id + state_hash + ready_marker + published_at + version + blocks + relationships) serializado vía `ciborium::ser::into_writer` sobre la struct **canonicalizada** (blocks y relationships ordenados antes de serializar). El digest es SHA-256 con dominio `b"ckl-aether-pkg-cbor-v2\0"` (post-H7); helpers `to_cbor()` / `from_cbor()` existen tanto en `AetherPackage` como en `SignedPackage`. La firma del envelope (H2) cubre todo el paquete en un solo digest.
+>
+> **⏭ DIFERIDO a v0.2:** el layout multi-archivo `manifest.json + slices/ + blobs/` + cursor `latest_slice_hash` descrito en §4.1, el deduplicado por blob CAS a través de slices, y el canal estático (S3 / gitops) descrito en §4.2 — toda la CLI de publish/subscribe queda fuera de v0.1. En v0.1 el transporte es **el envelope `AetherPackage` solo**, intercambiable como un único archivo `.cbor` (file/HTTP/etc, fuera del scope del crate).
+
+### 4.1 Formato canónico
+
+```
+aether-package/
+├── manifest.json              # publisher, source name, latest_slice_hash, signed
+├── slices/
+│   ├── slice_<hash1>.cbor     # SignedSlice serializado en CBOR
+│   ├── slice_<hash2>.cbor
+│   └── ...
+└── blobs/
+    ├── <blob_oid_1>           # contenido raw (CAS)
+    ├── <blob_oid_2>
+    └── ...
+```
+
+**Por qué CBOR**: determinístico (canonical CBOR), binario eficiente, hashable. JSON pierde determinismo por orden de keys.
+
+**Por qué blobs separados**: deduplicación natural — si dos slices comparten un atom, su `blob_oid` apunta al mismo blob físico.
+
+### 4.2 Canal estático MVP
+
+| Aspecto | Decisión |
+|---|---|
+| **Backend** | S3 bucket público o repo Git (gitops) |
+| **URL pattern** | `https://aether.koslab.ai/<publisher>/<source>/manifest.json` |
+| **Discovery** | Manual: usuario añade URL al añadir Source `Aether` |
+| **Updates** | Pull-based: client poll manifest, descarga slices nuevos |
+
+### 4.3 Sub-tareas
+
+| # | Tarea | Crate | Esfuerzo |
+|---|---|---|---|
+| S3.1 | Canonical CBOR serde para `SignedSlice` | `ckl-aether-format` | M |
+| S3.2 | Layout writer (publisher → directorio o S3) | `ckl-aether-format` | M |
+| S3.3 | Manifest schema + cursor (latest_slice_hash) | `ckl-aether-format` | S |
+| S3.4 | CLI: `ckl aether publish --target s3://...` | `ckl-cli` | M |
+| S3.5 | Tests: round-trip serialization + hash stability | `ckl-aether-format/tests` | S |
+
+---
+
+## 5. Hito 4 — `ckl-aether-client` (cache + verify)
+
+> **Goal**: Que cualquier CKL pueda **consumir** un Aether package: descargar, verificar firma, materializar el `aether_entity` local, y mantenerse al día.
+
+> **🔄 IMPLEMENTADO (v0.1) — librería pura + Intent.** En v0.1 `ckl-aether-client` es una **librería sin I/O**, expone dos funciones puras:
+> - `verify_package(signed, package, root_pk, now) -> Result<()>` — chequea cert+TTL+firma+digest.
+> - `prepare_import(package, target_doc, now) -> Result<ImportPlan>` — produce un plan determinístico con `blocks: Vec<Block>`, `local_relationships: Vec<LocalRelationship>` y `pending_relationships: Vec<PendingRelationship>`.
+>
+> La aplicación al storage local pasa por `Intent::ImportAetherPackage { signed, package, root_pk, target_document, provenance }` en `ckl-runtime` (H8), que ejecuta verify → prepare_import → put_block/put_relationship via **gateway sellado** (`__cip_storage_sealed()`). Idempotente por re-import: block ids se preservan literal del wire, rel ids son SHA-256 de `(publisher, slice, idx)` → `rel_aether_<12hex>`.
+>
+> **⏭ DIFERIDO a v0.2:** fetch HTTP/S3 + CLI `ckl aether subscribe URL` / `ckl aether sync` (en v0.1 los bytes del envelope llegan al runtime fuera del scope del crate — file/MCP/tooling externo); el cache layer LRU/GC del §5.2; la persistencia de `pending_relationships` en una tabla dedicada (en v0.1 emergen como `result.warnings` y se descartan, ver §6).
+
+### 5.1 Diagrama de flujo
+
+```mermaid
+graph TD
+    A[ckl aether subscribe URL] --> B[Fetch manifest.json]
+    B --> C{Manifest válido?}
+    C -->|no| F[Error]
+    C -->|sí| D[Crear Source kind=Aether<br/>project=None]
+    D --> E[Auto-crear aether_entity]
+    E --> G[Pull slices nuevos]
+    G --> H[Verify signature]
+    H -->|ok| I[Apply atoms con blob_oid CAS]
+    H -->|fail| F
+    I --> J[Persist SignedSlice]
+    J --> K[Listo: queries normales sobre aether_entity]
+```
+
+### 5.2 Cache layer
+
+- **Block-level cache**: ya viene gratis vía `blob_oid` en CKL — un blob en CAS no se descarga 2 veces.
+- **Slice-level cache**: solo descargamos slices nuevos (cursor en manifest).
+- **Invalidation**: hash es invariante; nunca invalidamos, solo añadimos.
+
+### 5.3 Sub-tareas
+
+| # | Tarea | Crate | Esfuerzo |
+|---|---|---|---|
+| S4.1 | `ckl-aether-client` crate (HTTP/S3 fetch + parse) | `ckl-aether-client` | M |
+| S4.2 | Verify signature al pull | `ckl-aether-client` | S |
+| S4.3 | Apply slice → atoms en `aether_entity` local | `ckl-aether-client` | M |
+| S4.4 | CLI: `ckl aether subscribe URL` / `ckl aether sync` | `ckl-cli` | M |
+| S4.5 | Test E2E: publisher → static dir → consumer | `ckl-aether-client/tests` | M |
+
+### 5.4 Criterio de aceptación
+
+```bash
+# Publisher
+$ ckl aether publish --source react --target s3://aether.koslab.ai/koslab/react/
+
+# Consumer (otra máquina)
+$ ckl aether subscribe https://aether.koslab.ai/koslab/react/
+$ ckl aether sync
+$ ckl ask "how do hooks work?"  # responde con knowledge consumido de Aether
+```
+
+---
+
+## 6. Hito 5 — `PUBLISHED_TO_AETHER` relación + queries cross-package
+
+> **Goal**: Permitir que knowledge de un Project local **referencie** y **enlace** con knowledge de un `aether_entity` consumido. Es lo que cierra el loop: Aether ya no es solo un append, es un grafo navegable.
+
+> **🔄 IMPLEMENTADO (v0.1) — abstracciones sobre `RelationshipType` existentes.** Para no invadir la enum core de relaciones todavía, v0.1 modela cross-package edges sin variantes nominales nuevas:
+> - `LocalRelationship(Relationship)` — edge cuyo source y target ya están materializados localmente; usa el `RelationshipType` existente del wire (ej. `DEPENDS_ON`).
+> - `PendingRelationship { source_block, target_aether_uri, rel_type, ... }` — edge cuyo target apunta a `aether://<publisher>/<source>/<block>` y aún no tiene contraparte local. `prepare_import` lo segrega en `ImportPlan.pending_relationships`.
+> - `LocalAetherIndex` — registro local que mapea aether-URIs ↔ block ids resueltos (resolver-ready).
+>
+> Las variantes nominales `RelationshipType::PublishedToAether` y `RelationshipType::DerivedFromAether` propuestas abajo **no se añadieron** en v0.1; pueden agregarse en v0.2 sin breaking change del wire (el envelope CBOR transporta `rel_type: String` opaca).
+>
+> **⏭ DIFERIDO a v0.2:** persistencia real de `PendingRelationship` (tabla `aether_pending_rel`), el resolver que las promueve a `LocalRelationship` cuando el target llega en un import posterior, las queries cross-package del §6.3, las variantes nominales en `RelationshipType`, y la reconciliation cuando un publisher emite un slice nuevo. En v0.1 las pending edges se reportan como `result.warnings` del Intent y se descartan.
+
+### 6.1 Nueva variante de relación
+
+```rust
+pub enum RelationshipType {
+    // ... existing ...
+    PublishedToAether,                   // local block → aether atom
+    DerivedFromAether,                   // local atom usa aether atom como base
+}
+```
+
+### 6.2 Casos de uso
+
+```mermaid
+graph LR
+    LB[Block local<br/>my-app/src/auth.rs] -->|DERIVED_FROM_AETHER| AA[Atom aether<br/>react/hooks/useAuth]
+    LB -->|PUBLISHED_TO_AETHER| AB[Atom aether<br/>my-app/auth-pattern]
+
+    style LB fill:#fef3c7
+    style AA fill:#dbeafe
+    style AB fill:#dbeafe
+```
+
+- **DERIVED_FROM_AETHER**: tu código usa un patrón de un publisher externo → linkeas a su atom canónico.
+- **PUBLISHED_TO_AETHER**: tu propio knowledge fue graduado a Aether → linkeas tu local con la versión publicada (para tracking).
+
+### 6.3 Sub-tareas
+
+| # | Tarea | Crate | Esfuerzo |
+|---|---|---|---|
+| S5.1 | Variantes en `RelationshipType` | `ckl-types` | XS |
+| S5.2 | Queries: `find_atoms_in_aether_referenced_by(local_block)` | `ckl-store` | M |
+| S5.3 | Reconciliation: detectar cuando aether atom cambia (slice nuevo) | `ckl-aether-client` | L |
+| S5.4 | UI/API: surfacing aether sources al user en queries | `ckl-mcp` | M |
+| S5.5 | Tests: cross-package graph traversal | `ckl-store/tests` | S |
+
+---
+
+## 7. Roadmap visual
+
+```mermaid
+gantt
+    title Aether — Camino C
+    dateFormat YYYY-MM-DD
+    axisFormat %b
+
+    section Hito 1
+    Source.entity_id + Aether kind     :h1a, 2026-05-12, 5d
+    Intents + auto-bind                :h1b, after h1a, 5d
+    publish_to_aether + tests          :h1c, after h1b, 7d
+
+    section Hito 2
+    ckl-aether-sign keypair            :h2a, after h1c, 5d
+    SignedSlice + hooks                :h2b, after h2a, 7d
+
+    section Hito 3
+    Canonical CBOR + layout            :h3a, after h2b, 7d
+    CLI publish + manifest             :h3b, after h3a, 5d
+
+    section Hito 4
+    ckl-aether-client + cache          :h4a, after h3b, 10d
+    CLI subscribe/sync + E2E           :h4b, after h4a, 7d
+
+    section Hito 5
+    Relationships + queries            :h5a, after h4b, 7d
+    Reconciliation + UI                :h5b, after h5a, 10d
+
+    section v0.1 cierre
+    H6 export_aether_package           :done, h6, 2026-05-08, 1d
+    H7 CBOR migration (ciborium)       :done, h7, 2026-05-08, 1d
+    H8 Intent::ImportAetherPackage     :done, h8, 2026-05-09, 1d
+    H10 two-tenant E2E                 :done, h10, 2026-05-09, 1d
+```
+
+> **Estado v0.1 (2026-05-09):** H1–H5 implementados con el alcance acotado descrito en las admonitions de cada sección; H6 (exporter público), H7 (migración a CBOR canónico), H8 (Intent de import vía gateway sellado) y H10 (E2E publisher↔subscriber a través de archivo CBOR en disco) cerrados en branch `feat/aether-v0.1`. El resto del roadmap (h2b SignedSlice persistido, h3a/b layout multi-archivo + CLI, h4a/b fetch+CLI+cache, h5a/b reconciliation+UI) queda como roadmap v0.2+.
+
+---
+
+## 8. Lo que NO está en v0 (explícito)
+
+> **🔄 v0.1 — diferimientos confirmados durante la implementación.** Por encima de los diferimientos estratégicos del Camino C, el cierre real de v0.1 deja explícitamente fuera de scope:
+>
+> | Área | Qué se difiere | Sección |
+> |---|---|---|
+> | Firma | `TrustAnchor` enum (multi-anchor / KMS), revocación, rotación de claves, `SignedSlice` como tipo persistido en storage | §3 |
+> | Formato | Layout multi-archivo `manifest.json + slices/ + blobs/`, cursor `latest_slice_hash`, blobs CAS separados a través de slices | §4 |
+> | Transporte | Backend S3 / repo Git, URL pattern `aether.koslab.ai/...`, pull-based updates, CLI `ckl aether publish` | §4 |
+> | Consumer | Fetch HTTP/S3 dentro de `ckl-aether-client`, cache layer LRU + GC, CLI `ckl aether subscribe` / `ckl aether sync` | §5 |
+> | Grafo | Persistencia de `PendingRelationship` en tabla dedicada, resolver, queries cross-package (`find_atoms_in_aether_referenced_by`), variantes nominales `RelationshipType::{PublishedToAether, DerivedFromAether}`, reconciliation por slice nuevo | §6 |
+>
+> En v0.1 el envelope CBOR autocontenido `AetherPackage` + el par `verify_package` / `Intent::ImportAetherPackage` son el contrato mínimo end-to-end; todo lo demás del roadmap es post-v0.1.
+
+| Feature | Por qué se difiere | Hito futuro |
+|---|---|---|
+| Forks de publishers | Necesita reconciliation + diff de slices | v0.2 |
+| Federación entre publishers | Requiere protocolo de discovery | v0.3 |
+| Privacidad/cifrado por consumer | Requiere KMS + audience targeting | v0.3 |
+| Trust delegation chains | KOSLAB es trust anchor único en MVP | v0.2 |
+| Push-based updates (webhook) | Pull-only en MVP | v0.2 |
+| Métricas de adoption por atom | Requiere telemetry opcional | v0.4 |
+
+---
+
+## 9. Riesgos y mitigaciones
+
+| Riesgo | Probabilidad | Impacto | Mitigación |
+|---|---|---|---|
+| Auto-creación de entity rompe invariantes existentes | Media | Alto | Test exhaustivo S1.4; flag para desactivar en migración |
+| Canonical CBOR no determinístico en edge cases | Baja | Alto | Adoptar `ciborium` con canonical mode + property tests |
+| Firma con clave perdida → publisher offline | Media | Medio | Multi-key support en H2 (futuro); backup mandatorio en docs |
+| Slice grande (>10MB) bloquea CLI | Media | Medio | Streaming + chunked download desde H3 |
+| Cache local crece sin límite | Alta | Bajo | LRU + GC en H4 (post-MVP) |
+
+---
+
+## 10. Próximos pasos inmediatos
+
+1. **Aprobar este v0** (este doc).
+2. **Doc #3**: *Aether — Pipeline de Publicación KOSLAB* (operacional: cómo KOSLAB usa este pipeline para publicar su primer source — probablemente el knowledge interno de CKL mismo, dogfooding).
+3. **Empezar S1.1**: PR pequeño añadiendo `Source.entity_id` y `SourceKind::Aether`. Es la única decisión que tiene fricción de schema; mejor cerrarla primero.
+
+---
+
+## Apéndice A — Glosario rápido (referencias a CKL)
+
+| Término | Tipo CKL | Crate |
+|---|---|---|
+| `aether_entity` | `KronosEntity` con purpose `aether-publication` | `ckl-types` |
+| `aether_source` | `Source { kind: SourceKind::Aether, entity_id: Some(_) }` | `ckl-types` |
+| publicación | `GraduationOutcome { reason: PublishedToAether }` | `ckl-temporal` |
+| slice firmado | `SignedSlice { slice: KronosSlice, signature: ed25519 }` | `ckl-aether-sign` (nuevo) |
+| paquete canónico | layout `aether-package/{manifest,slices,blobs}` | `ckl-aether-format` (nuevo) |
+| consumir | `ckl-aether-client::sync(url)` | `ckl-aether-client` (nuevo) |
+| referencia cruzada | `Relationship { kind: DerivedFromAether }` | `ckl-types` |
+
+---
+
+## Apéndice B — Crates nuevos
+
+| Crate | Responsabilidad | Hito |
+|---|---|---|
+| `ckl-aether-sign` | Keypair management, firma/verify | H2 |
+| `ckl-aether-format` | Canonical CBOR, package layout, manifest | H3 |
+| `ckl-aether-client` | Fetch, verify, apply, cache | H4 |
+
+Total: **3 crates nuevos**, **0 crates modificados estructuralmente** (solo extensiones de tipos/intents).
+
+---
+
+*Doc #2 de la serie Aether. Ver Doc #1 para concepto. Próximo: Doc #3 sobre pipeline operativo de KOSLAB.*
