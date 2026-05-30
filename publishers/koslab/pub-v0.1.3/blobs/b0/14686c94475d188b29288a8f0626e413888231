@@ -1,0 +1,430 @@
+# Aether — Concepto y Principios de Diseño
+
+**Documento #1 de la serie Aether** · v0.2 · draft · Mayo 2026
+
+> Este documento es **conceptual y de principios**. La arquitectura técnica vive en el doc #2. La operación de KOSLAB como primer publicador vive en el doc #3.
+
+---
+
+## Changelog
+
+- **v0.2 (mayo 2026)** — Tras cerrar Áreas A/B/C y consolidar la visión global:
+  - §4 actualizada con estado shipping de las decisiones MVP.
+  - §6 marca qué adiciones a CKL ya están en código (PR #118).
+  - §7 reorganiza los "horizontes" a Áreas concretas (D-I) del roadmap.
+  - **Nuevas secciones §10-§16:** transporte por capas (T1/T2/T3), autoría cross-publisher (6 patrones), identidad temporal explícita (desarrollo de Axioma 2), modelo de confianza como permisos, source-drop vs takedown, problemas abiertos, roadmap de Áreas.
+  - Glosario extendido con T1/T2/T3, `EVOLVES_TO`, `PendingRelationship`, `SAME_AS`.
+- **v0.1 (mayo 2026)** — Primer cierre conceptual. Seis axiomas, cinco decisiones MVP, tres capas de adopción.
+
+---
+
+## 1. Qué es Aether
+
+Aether es la **L3 — capa global de conocimiento** del manifiesto KOS. Es la red pública donde el conocimiento de la humanidad — código, decisiones, lecciones, patrones — vive como **átomos publicados, evolutivos, citables y verificables**.
+
+No es una base de datos central. No es una blockchain. No es un repositorio de documentos. Aether es un **espacio compartido de átomos** sobre el que CKL local puede consultar, citar, anclar y razonar.
+
+**Lo que Aether no es:**
+- No es un reemplazo de Stack Overflow, MDN, ni docs oficiales — es la capa que los **conecta** y los hace ciudadanos del mismo grafo.
+- No es una red social — no hay perfiles, likes, ni feeds.
+- No es un LLM ni un servicio de inferencia — es la materia prima de razonamiento, no el razonador.
+
+---
+
+## 2. Por qué existe
+
+Hoy todo el conocimiento técnico del mundo es **estático, fragmentado y desincronizado del razonamiento**. La documentación de React vive en un sitio, los issues de GitHub en otro, la sabiduría tribal en Slack, las lecciones en cabezas individuales. Cuando un agente IA o un humano necesita razonar, tiene que reconstruir el contexto desde cero cada vez.
+
+Aether existe para que el conocimiento sea **un sustrato compartido, evolutivo y direccionable** — accesible al humano y al agente con el mismo lenguaje, conectado al razonamiento local sin perder identidad ni linaje.
+
+---
+
+## 3. Los seis axiomas fundacionales
+
+Aether se construye sobre seis principios que la primera versión debe respetar de forma absoluta. Cada axioma corresponde a una regla que **CKL/Kronos ya enforce-a hoy** o a una extensión natural y pequeña.
+
+### Axioma 1 — El conocimiento no se transforma, evoluciona
+
+> *Una vez que un átomo entra a Aether, su contenido es inmutable. Los cambios producen átomos nuevos vinculados al original; las versiones anteriores siguen siendo citables y verificables para siempre.*
+
+**Validado contra CKL:** El enum `EvolutionAction` (`crates/ckl-types/src/kronos.rs`) **no contiene una variante `Edit`**. Todas las acciones de evolución son `Synthesis` (fusionar fuentes en un nuevo átomo), `ContradictionResolution` (retractar el débil, no editarlo), `Deprecate`, `Strengthen`, `Weaken`, `Archive` o `Advisory`. Ninguna sobrescribe contenido. La regla está embebida en el modelo de tipos.
+
+### Axioma 2 — Cada slice es una foto sellada
+
+> *Las referencias a Aether son estables porque cada estado del conocimiento queda capturado en un slice criptográficamente sellado. Modificar un slice rompe la cadena y queda detectable; reescribir el pasado es imposible sin que todo lo que cita ese pasado lo notifique.*
+
+**Validado contra CKL:** `TemporalSlicer` (`crates/ckl-temporal/src/slicer.rs:11`) literalmente se documenta como *"creates immutable snapshots of knowledge state"*. El hash es Merkle-encadenado: `SHA256(parent_hash ‖ trigger ‖ sorted_atom_fingerprints)` con dos versiones (v1 inline, v2 sobre `blob_oid` content-addressed). El método `verify(slice, parent, trigger, atoms) -> bool` permite auditar cualquier slice contra su padre.
+
+> **Consecuencia desarrollada en §12:** este axioma habilita identidad temporal explícita — un bloque no tiene "una versión", tiene una **historia firmada** consultable.
+
+### Axioma 3 — Linaje obligatorio
+
+> *Todo átomo en Aether sabe de dónde viene: qué átomo lo originó, qué sesión lo graduó, cuándo nació, por qué fue publicado, y qué átomos posteriores lo refuerzan, contradicen o supersedan. El olvido del origen está prohibido.*
+
+**Validado contra CKL:** Ya existen las primitivas:
+- `Provenance { source_entity, source_session, graduated_at, original_created_at, reason: GraduationReason }` (`kronos.rs:856`)
+- `PersistentCausalEdge { from, to, edge_type, status: EdgeStatus::{ Active, Superseded } }` (`kronos.rs:545`)
+- `GraduationRecord { source_weight, source_layer, target_layer, provenance, outcome }` con persistencia full-fidelity verificada en tests.
+
+### Axioma 4 — Toda escritura lleva firma
+
+> *Aether no acepta mutaciones anónimas. Cada átomo publicado lleva atrás un publicador identificado y una declaración de intención (Intent) que la red puede verificar.*
+
+**Validado contra CKL:** En CKL ya rige la **CIP Gateway Policy v0.2.0** (`storage.rs:67-79`). El trait `StoragePort` es **read-only**; los métodos de escritura viven en `__internal::StorageWrites`, sealed con un marker `Sealed` que solo `ckl-runtime::protocol`, `ckl-core::epistemic` y `ckl-temporal` pueden implementar. Todo write pasa por `IntentEngine::execute(Intent::*)` y adjunta `RelationshipProvenance` o `MutationProvenance`. Hay tests `trybuild` que verifican que los writes externos directos **no compilan**.
+
+→ Aether hereda este modelo. Publicar a Aether es el `Intent::PublishToAether` que fuerza signing Ed25519 del publisher (✅ shipped Área B).
+
+### Axioma 5 — Átomo portable, vector contextual
+
+> *La unidad transmitida es el átomo (contenido + metadata + linaje), no la vectorización. Cada CKL local re-vectoriza con el modelo que prefiera. El contenido viaja; el embedding es local.*
+
+**Validado contra CKL:** Atoms ya son first-class en el storage (v0.5.0). El trait `StoragePort` expone `get_atom`, `list_atoms`, `list_atoms_by_container`, `list_atoms_by_holder`, `list_atoms_by_kind`. El tipo `Atom` tiene namespace `atm_…` disjunto de `blk_…`, con `kind: AtomKind { Code, Claim, Proof }`, `holder: AgentId` y `container: Option<BlockId>`. El concepto del *átomo como conocimiento puro con proyecciones* del manifiesto **ya está implementado como tipo**. Aether publica átomos; cada cliente reconstruye sus proyecciones (incluyendo embeddings) localmente.
+
+### Axioma 6 — Promoción por mérito, con quality gate
+
+> *Un átomo no llega a Aether porque alguien lo subió. Llega porque maduró: alcanzó una capa estable, fue accedido y reforzado lo suficiente, sobrevivió contradicciones, y un publicador autorizado decidió graduarlo. La barrera de entrada es la pesa contra el ruido.*
+
+**Validado contra CKL:** El `GraduationEngine` ya implementa exactamente esta semántica para session→shared entity (`crates/ckl-temporal/src/graduation.rs`). Evalúa cada átomo contra un `GraduationGate { min_weight, min_layer, min_total_accesses, min_coherence, contradiction_free, min_age_seconds }`, deduplica por solapamiento de contenido > 60% contra el target, y o **refuerza** un átomo existente (emitiendo `NutrientType::Reinforcement`) o lo **gradúa** como novel a `Layer::Low` con weight inicial `0.2`. **Aether es la misma primitiva con `target_entity = entidad_aether`** — la maquinaria existe; lo que falta es la capa de publicación firmada encima.
+
+---
+
+## 4. Las cinco decisiones cerradas para el MVP
+
+| # | Decisión | Forma |
+|---|---|---|
+| 1 | **Identidad** | `aether:<publisher>/<source>/<blk_id>[@<slice>]`. `blk_id` deriva del contenido (estable vía `blob_oid`). Aliases humanos opcionales como metadata viviente. Mapping de movimientos en slices para sobrevivir splits/merges. |
+| 2 | **Versionado** | Un único slice "stable" por publicador en MVP. Trazabilidad contextual de slices (consulta a un punto temporal específico — ej. *"React 18.2"*) entra como **compromiso post-MVP**, apoyada en la cadena Merkle ya existente. |
+| 3 | **Consumo** | Pull-on-demand con cache local agresivo. El cliente CKL pide átomos a Aether solo cuando los necesita y los cachea. No hay sincronización masiva. |
+| 4 | **Privacidad** | No-log policy por contrato + cache local que oculta patrones de re-acceso. PIR / mirror network como horizonte, no como MVP. |
+| 5 | **Vinculación cross-paquete** | Vía el grafo de relaciones existente de CKL. Un bloque local cita un átomo de Aether con la **misma sintaxis de relaciones** que un bloque local cita a otro. Branches/forks como horizonte. |
+
+### 4.1 — Estado a v0.2 (mayo 2026)
+
+Las cinco decisiones siguen vigentes. Áreas A/B/C consolidaron tres de ellas en código:
+
+- **Decisión #1 (identidad federada)** → composite PK `(PublisherId, BlockId)` shipped (H1, Área C). El sufijo `@<slice>` se desarrolla formalmente en §12 como eje temporal explícito.
+- **Decisión #2 (firma Ed25519 + slices)** → `SignedPackage` + `SignedManifest` shipped (Área B). Anti-replay vía `ProvenanceEntry` + `Intent::GetBlockProvenance` (H2). El cierre del compromiso post-MVP de "trazabilidad contextual" entra formalmente en Área D.
+- **Decisión #4 (visibility + allowlist)** → `PublisherAllowlistEntry`, `Source.active`, `is_publisher_visible` shipped (H7-A/B/C). Modelo de confianza desarrollado en §13.
+
+Decisiones #3 (pull-on-demand) y #5 (vinculación cross-paquete) siguen siendo principio; su materialización operacional vive en §10 (transportes T1/T2/T3) y §11 (autoría cross-publisher).
+
+---
+
+## 5. Las tres capas, otra vez
+
+```mermaid
+graph TB
+    subgraph L3 [L3 · Aether — Conocimiento Global]
+        A1[Átomos publicados<br/>+ slices sellados<br/>+ provenance firmada]
+    end
+    subgraph L2 [L2 · Conocimiento Organizacional]
+        B1[Entities compartidas<br/>graduadas desde sesiones]
+    end
+    subgraph L1 [L1 · Conocimiento Personal]
+        C1[Sesiones · átomos en formación<br/>· proyectos privados]
+    end
+
+    C1 -- "graduate(min_weight,<br/>min_layer, min_age)" --> B1
+    B1 -- "publish(signing,<br/>Intent::PublishToAether)" --> A1
+    A1 -- "pull-on-demand<br/>+ cache + verify" --> C1
+
+    style L3 fill:#1a1a2e,stroke:#D4AF37,stroke-width:2px,color:#fff
+    style L2 fill:#16213e,stroke:#7a9cc6,stroke-width:1px,color:#fff
+    style L1 fill:#0f3460,stroke:#5fb3a1,stroke-width:1px,color:#fff
+```
+
+**Lo importante:** la flecha L1→L2 (graduate) **ya existe en CKL hoy** como `GraduationEngine.graduate()`. La flecha L2→L3 (publish) es **la misma primitiva** con un target especial y un Intent firmado encima (✅ shipped). La flecha L3→L1 (pull) es el cliente Aether — desarrollado por capas en §10.
+
+> **Nota de nomenclatura (importante para §10):** las capas L1/L2/L3 de esta sección describen **quién publica** (Personal / Organizacional / Global). Las capas T1/T2/T3 de §10 describen **cómo viaja el conocimiento** (Bulk / Query / Discovery). Son ejes ortogonales.
+
+---
+
+## 6. Lo que cambia en CKL para Aether — minimalista
+
+CKL ya hace el 80% del trabajo. Para que Aether sea posible en MVP solo se necesitan **cuatro adiciones puntuales**, todas compatibles hacia atrás:
+
+1. **`Intent::PublishToAether`** — ✅ **shipped (Área B)**. Nuevo intent en `IntentEngine` que toma un set de átomos graduados a una entity-Aether, los firma con la clave del publicador y los empuja al canal de publicación. Reusa toda la maquinaria CIP existente.
+
+2. **Cliente Aether** (crate `ckl-aether-client`) — ✅ **shipped (Áreas B/C)** como capa storage-agnostic/transport-agnostic de verify + import + resolver H4/H5. El **transporte** (T1 bulk / T2 query / T3 discovery, §10) vive fuera del client y se entrega por Áreas E/F/G.
+
+3. **Slice publication metadata** — ✅ **shipped (Área B + H2)** vía `SignedManifest` con anti-replay y `ProvenanceEntry` indexable.
+
+4. **`PUBLISHED_TO_AETHER` relationship type** — ⏳ pendiente como variante explícita. Hoy se aproxima vía `ProvenanceEntry` + `Intent::GetBlockProvenance` (H2). Se cierra como follow-up dentro de Área E.
+
+Lo que **no** se necesita:
+- ❌ Reemplazar `BlockId` por hash puro (el `blob_oid` content-addressed ya da la propiedad).
+- ❌ Bloquear `delete_block` desde fuera (el sealed gateway ya lo bloquea).
+- ❌ Añadir un campo `lineage` a `Block` (ya está en `Provenance` y `PersistentCausalEdge`).
+- ❌ Forzar inmutabilidad por separado (ya está garantizada por la ausencia de `EvolutionAction::Edit`).
+
+---
+
+## 7. Fronteras explícitas — qué queda fuera del MVP
+
+Las "fronteras" de v0.1 se reasignaron a Áreas concretas del roadmap (§16). Siguen **fuera de scope MVP**, pero ahora tienen casa:
+
+| Tema | v0.1 | v0.2 — Área asignada |
+|---|---|---|
+| Forks / divergencias | "Doc #4" sin home | §11 cross-publisher · Área D (identidad temporal) |
+| Federación operacional entre publicadores | "Doc #5" sin home | §10 transportes · Áreas E (T1) / F (T2) / G (T3) |
+| Privacidad / selective disclosure | "Doc #6" sin home | §13 trust model · Área futura post-G |
+| Convergencia semántica cross-publisher | no mencionado | §15 open problems · Áreas H (descubrimiento) / I (convergencia) |
+| Trazabilidad contextual de slices | "Doc #2 v0.2" | §12 identidad temporal · **Área D (próxima)** |
+| Modelos de embeddings cross-publisher | "Doc #2" | §15 P1 · Área H |
+| Monetización / sostenibilidad económica | "Documento de negocio aparte" | (mantenido fuera de scope técnico) |
+| PIR / mirror network / blockchain anchor | "Horizonte" | §14 (mirrors emergen naturalmente) · privacy fuerte → post-G |
+
+---
+
+## 8. Definición de éxito del MVP
+
+Aether v0.1 es un éxito si:
+
+1. **KOSLAB publica** un primer paquete curado (React docs, Python stdlib, Postgres docs, Rust std, TypeScript handbook) como entities-Aether firmadas.
+2. **CKL local resuelve** una referencia `aether:react/docs/blk_xxx` desde un cliente fresco, vía pull-on-demand y cache, en menos de 500ms p95.
+3. **El grafo local cita** átomos de Aether con la misma sintaxis con la que cita átomos locales — un agente razonando sobre `useEffect` no distingue si la fuente es local o pública, solo ve el grafo.
+4. **Cada átomo publicado** lleva su `Provenance` completo y es verificable contra la firma del publicador.
+5. **La regla de inmutabilidad sobrevive el primer ciclo de actualización**: cuando React 18.3 sale, el slice de 18.2 sigue intacto y citable; las referencias antiguas no se rompen.
+
+---
+
+## 9. Próximos documentos
+
+- **Doc #2 — Aether: Arquitectura v0** · mapeo técnico sobre CKL: `Intent::PublishToAether`, cliente Aether, formato de canal, signing scheme, cache local. Construido sobre los tipos y traits ya existentes.
+- **Doc #3 — Aether: Pipeline de Publicación KOSLAB** · operativo, sprint 0: qué fuentes curamos primero, cómo las indexamos, cómo las graduamos a entity-Aether, cómo las firmamos, cómo las versionamos.
+
+---
+
+## 10. Transporte por capas (T1/T2/T3)
+
+Aether no es una tubería sino **tres capas de transporte complementarias** sobre el mismo material criptográfico (un `SignedPackage` con firmas Ed25519 por slice).
+
+> **Recordatorio de nomenclatura:** las capas L1/L2/L3 del §5 describen *quién publica*. Las capas T1/T2/T3 de esta sección describen *cómo viaja el conocimiento*. Ejes ortogonales.
+
+| Capa | Nombre | Función | Tecnología | Cuándo |
+|---|---|---|---|---|
+| **T1** | Bulk / Archival | Descarga completa y verificable de un source | HTTP estático + CBOR firmado | Réplica integral, mirror, archivo de largo plazo |
+| **T2** | Query on-demand | Consulta puntual de bloque + relaciones | gRPC streaming + merkle proofs | Agente que necesita 1 bloque, no 47 |
+| **T3** | Discovery / Federación | Descubrir publishers y endpoints | Un publisher de Aether más (recursivo) | Encontrar a quién suscribirse |
+
+**Invariante criptográfico común:** las tres capas validan contra la misma firma Ed25519 del publisher sobre el `slice_digest`. T2 incluye prueba merkle de inclusión; T3 sólo distribuye metadatos firmados. **Una sola raíz de confianza** (la clave pública del publisher) protege las tres capas.
+
+```mermaid
+graph LR
+    PUB[Publisher KOSLAB] -->|firma slice| MAT[Material firmado<br/>SignedPackage]
+    MAT --> T1[T1 · Bulk<br/>HTTP estático]
+    MAT --> T2[T2 · Query<br/>gRPC]
+    MAT --> T3[T3 · Discovery<br/>registry firmado]
+    T1 --> SUB1[Subscriber<br/>mirror completo]
+    T2 --> SUB2[Agente<br/>1 bloque]
+    T3 --> SUB3[Cualquiera<br/>busca publishers]
+```
+
+**Por qué tres capas, no una:**
+- **T1 (Bulk)** es el suelo: zero-infra, hosting gratis (GitHub Pages, IPFS, S3 estático), mirrorable, censura-resistente, verificable at-rest. Lo que se publica una vez vive para siempre.
+- **T2 (Query)** es el techo: latencia baja, consumo selectivo, push de cambios. Requiere infra del publisher pero permite agentes razonando con un slice de la red, no con todo el archivo.
+- **T3 (Discovery)** es el grafo social: cómo te enteras de quién publica qué. Implementado recursivamente como otro publisher Aether — el registry firma una lista de publishers; tú lo tratas como cualquier otro source.
+
+**Orden de entrega del MVP:** T1 primero (Área E) → T2 después (Área F) → T3 al final (Área G). Razón: T1 valida toda la arquitectura criptográfica sin infra propia; T2 añade latencia/disponibilidad como producto; T3 requiere bootstrap social previo.
+
+---
+
+## 11. Autoría sobre conocimiento ajeno (cross-publisher)
+
+Cuando un publisher cita, extiende o contradice el conocimiento de otro, Aether transporta **la relación, no el bloque ajeno**. El bloque externo queda como referencia (`to_publisher_id=Some("koslab")`); la relación se materializa localmente en el subscriber sólo si éste también tiene el publisher referenciado montado (resolver H4/H5, sino → `PendingRelationship` con TTL configurable, ✅ shipped Área C / H3).
+
+### 11.1 Seis patrones canónicos
+
+Todos ya soportados por `RelationshipType` en `ckl-types`:
+
+| Patrón | Variante | Semántica | Ejemplo |
+|---|---|---|---|
+| **REFERENCES** | base | "yo cito" | Sergio cita `koslab:aether/composite_pk` |
+| **EXTENDS** | derivado | "yo profundizo" | Sergio extiende `koslab:aether/pending_edges` |
+| **CONTRADICTS** | desacuerdo | "yo disiento" | AcmeAI contradice una decisión KOSLAB |
+| **SUPERSEDES** | reemplazo | "esto reemplaza aquello" | Spec v0.4 supersedes v0.3 |
+| **SAME_AS** | equivalencia | "yo afirmo que son lo mismo" | Sergio afirma `lazy_resolution ≡ pending_edges` (variante 47, ✅ H5) |
+| **DERIVED_FROM** | linaje | "esto nació de aquello" | Paper de Sergio derivado de bloque KOSLAB |
+
+### 11.2 Reglas del protocolo
+
+1. La relación va **firmada por el publisher emisor**; el bloque destino **no se redistribuye**.
+2. La identidad del bloque destino es siempre con namespace explícito de publisher (composite PK preserva pertenencia, ✅ H1).
+3. Si el subscriber no tiene el publisher destino, la relación queda `Pending` con TTL (`pending_edge_ttl_secs`, ✅ H3) y se resuelve lazy on `put_block`.
+4. **`SAME_AS` es una afirmación, no una verdad** — el subscriber decide qué política aplicar (ver §13.3).
+
+---
+
+## 12. Identidad temporal explícita (desarrollo de Axioma 2)
+
+El Axioma 2 ("cada slice es una foto sellada") tiene una consecuencia profunda que merece especificación dedicada: **un bloque no tiene una versión, tiene una historia firmada**.
+
+### 12.1 Identificadores con eje temporal
+
+| Forma | Significado | Cuándo usarla |
+|---|---|---|
+| `aether://koslab/ckl-spec/blk_xyz` | "lo último que diga KOSLAB sobre `blk_xyz`" | Citas vivas, "siempre la más reciente" |
+| `aether://koslab/ckl-spec/slice_42/blk_xyz` | "**el contenido exacto que tenía `blk_xyz` cuando se firmó el slice 42**" — inmutable, criptográficamente verificable | Citas históricas, reproducibilidad, evidencia |
+
+### 12.2 Por qué importa
+
+> Cuando tú citas un bloque desde un slice específico, no estás citando "lo que sea que ese bloque diga hoy" — estás citando **lo que creías como realidad en ese momento**. La historiografía del conocimiento queda preservada.
+
+Esto habilita tres propiedades de orden mayor:
+
+1. **Trazabilidad de evolución** — relación `EVOLVES_TO` entre versiones del mismo `BlockId` en slices sucesivos. Saber *cómo* cambió una creencia, no sólo *que* cambió.
+2. **Reproducibilidad de razonamiento** — un agente puede reconstruir el estado de conocimiento en cualquier punto temporal de cualquier publisher.
+3. **Inmunidad a revisionismo** — una cita pinned no puede ser silenciosamente reescrita; los mirrors externos siguen sirviendo el slice firmado original.
+
+### 12.3 Modelo de storage
+
+- `(PublisherId, BlockId)` sin slice → última versión conocida (vista "viva").
+- `(PublisherId, BlockId, SliceId)` → versión congelada, verificable contra el `slice_digest` firmado.
+- Política de retención configurable (todas las versiones / ventana móvil / snapshots con cadencia).
+
+### 12.4 Estado y siguiente paso
+
+- v0.1 contemplaba `@<slice>` como sufijo opcional en la Decisión #1.
+- v0.2 lo eleva a **eje canónico**: la identidad temporal es ciudadana de primera clase, no un sufijo opcional.
+- **Área D — Per-slice identity & temporal pinning** materializa el wire format extendido, `EVOLVES_TO`, el storage y los hooks del resolver. Bloquea Áreas E/F/G porque cambia el shape del wire.
+
+---
+
+## 13. Modelo de confianza — permisos como agentes
+
+La confianza en Aether se modela como **permisos explícitos, análogos a los permisos de agentes de KOS** que requieren autorización para salir del workspace dedicado.
+
+### 13.1 Niveles de confianza por publisher
+
+| Nivel | Significado | Default |
+|---|---|---|
+| **Mounted** | "Importo paquetes firmados por este publisher" | Opt-in explícito |
+| **Visible** | "Las consultas pueden retornar bloques de este publisher" | On por default si Mounted |
+| **Authoritative** | "Si dice algo, lo trato como hecho local" | Off por default · opt-in |
+| **Auto-extend** (trust transitive) | "Confío en quien él confíe" | Off por default · opt-in con scope (depth, allowlist) |
+
+### 13.2 Materialización en código
+
+✅ Shipped Área C (H7):
+- `PublisherAllowlistEntry` + `RuntimeConfig.publisher_allowlist_mode` (Open default, Strict configurable).
+- `Source.active: bool` para cascade visibility.
+- `is_publisher_visible` query gate.
+- `Intent::SetSourceActive`, `Intent::SetPublisherAllowlist`.
+
+CLI prevista (parte de Área E):
+```
+ckl aether trust add koslab --level mounted
+ckl aether trust add koslab --level authoritative --auto-extend depth=1
+ckl aether trust list
+ckl aether trust revoke acme-ai
+```
+
+### 13.3 `SAME_AS` como claim, no como verdad
+
+Una afirmación de equivalencia es un dato firmado, no un veredicto global. El protocolo transporta la afirmación; el subscriber decide qué hacer con ella.
+
+**Tres políticas posibles por subscriber:**
+- `ignore` — la afirmación llega pero no afecta el grafo (default conservador).
+- `show` — se muestra como aviso al razonar, pero los nodos siguen separados.
+- `merge` — se tratan como el mismo concepto en consultas locales.
+
+**Tres niveles de fuerza** que la UI puede destacar:
+- **Unilateral** — sólo el emisor afirma la equivalencia.
+- **Bilateral** — ambos publishers afirman recíprocamente.
+- **N-way / endorsed** — varios publishers convergen en la misma afirmación (entrada natural a Área I, §15).
+
+---
+
+## 14. Source-drop, no takedown
+
+La inmutabilidad por slice (Axioma 2 + §12) hace **el takedown criptográficamente imposible**: un slice firmado y replicado no puede ser retirado de mirrors existentes. Lo que sí puede ocurrir:
+
+| Evento | Qué pasa | Análogo familiar |
+|---|---|---|
+| **Publisher deja de publicar** | El source queda congelado en su último slice firmado | Repo archivado en GitHub |
+| **Endpoint cae** | T1/T2 inalcanzables; mirrors siguen sirviendo | Página web 404, archive.org sigue |
+| **Key revocation** | Slices nuevos rechazados; los firmados antes del revoke siguen válidos | Cert revocado |
+| **Doble firma** (mismo slice_id, contenido distinto) | Evidencia firmada de mal comportamiento; subscriber puede flaggear | Sismograma de inconsistencia |
+
+**Consecuencia de diseño:** Aether es una **Wayback Machine criptofirmada**. El conocimiento queda preservado por construcción; lo que se gestiona es la **disponibilidad** (mirrors, federación) y la **vigencia** (key rotation, `EVOLVES_TO`).
+
+---
+
+## 15. Problemas abiertos
+
+Estos retos requieren su propia discusión y materialización en Áreas dedicadas (§16). Se documentan aquí para anclar el roadmap.
+
+- **P1 — Descubrimiento semántico cross-publisher.** Si KOSLAB y AcmeAI publican sobre "consensus", ¿cómo encuentro la unión de sus bloques relevantes sin haberme suscrito explícitamente? Implica embedding compartido, indexado por T3, o federación de queries por T2. → **Área H.**
+- **P2 — Convergencia de conceptos.** Cuando N publishers publican `SAME_AS` cruzados entre `blk_A`, `blk_B`, `blk_C`, ¿el grafo global converge a un único concepto? ¿Con qué política (unanimidad, mayoría firmada, transitividad limitada)? → **Área I.**
+- **P3 — Selective disclosure / privacidad granular.** Publicar parte de un source sin exponer el resto, manteniendo verificabilidad. Probablemente vía slices privados con merkle proofs selectivos. → Área futura post-G.
+- **P4 — Rate-limit y circuit breaker por publisher** (subscriber-side). Anotado como follow-up Área C+/D.
+- **P5 — Trust pinning a fingerprint de clave** + key revocation flow operacional. Anotado como follow-up Área C+/D.
+
+---
+
+## 16. Roadmap de Áreas
+
+| Área | Nombre | Habilita | Bloquea a | Estado |
+|---|---|---|---|---|
+| A | Formato + firma | wire base | B | ✅ shipped |
+| B | Publish path | exportar paquetes firmados | C | ✅ shipped |
+| C | Hardening federado | composite PK, allowlist, provenance, T14 | D/E | ✅ shipped (PR #118) |
+| **D** | **Per-slice identity & temporal pinning** | citas inmutables, `EVOLVES_TO`, historiografía | E/F/G | 🎯 próximo |
+| **E** | **T1 Bulk transport** | HTTP estático + CI workflow + CLI `subscribe`/`pull`/`publish` | F | después de D |
+| **F** | **T2 Query transport** | gRPC + merkle proofs + agente on-demand | H | después de E |
+| **G** | **T3 Discovery** | registry como publisher recursivo | H | después de F |
+| **H** | **Federación semántica** | búsqueda cross-publisher, embedding federado | I | después de G |
+| **I** | **Convergencia de conceptos** | SAME_AS transitive, política de fusión, claims n-way | — | horizonte |
+
+**Criterio de cierre por Área:** spec publicada + threat model actualizado + hitos verificables (H1, H2, ...) + tests E2E + PR mergeado a `develop`.
+
+```mermaid
+graph LR
+    A[A · Formato + firma<br/>✅] --> B[B · Publish<br/>✅]
+    B --> C[C · Hardening<br/>✅ PR #118]
+    C --> D[D · Identidad temporal<br/>🎯 próximo]
+    D --> E[E · T1 Bulk]
+    E --> F[F · T2 Query]
+    F --> G[G · T3 Discovery]
+    G --> H[H · Federación semántica]
+    H --> I[I · Convergencia]
+    style A fill:#1a4731,stroke:#5fb3a1,color:#fff
+    style B fill:#1a4731,stroke:#5fb3a1,color:#fff
+    style C fill:#1a4731,stroke:#5fb3a1,color:#fff
+    style D fill:#1a1a2e,stroke:#D4AF37,stroke-width:2px,color:#fff
+    style E fill:#0f3460,stroke:#7a9cc6,color:#fff
+    style F fill:#0f3460,stroke:#7a9cc6,color:#fff
+    style G fill:#0f3460,stroke:#7a9cc6,color:#fff
+    style H fill:#16213e,stroke:#7a9cc6,color:#fff
+    style I fill:#16213e,stroke:#7a9cc6,color:#fff
+```
+
+---
+
+## Apéndice A — Glosario de términos validados contra CKL
+
+| Término | Definición | Tipo / archivo en CKL |
+|---|---|---|
+| **Átomo** | Unidad mínima de conocimiento puro: contenido + tipo + holder + container opcional | `Atom` en `ckl-core/src/storage.rs:311` |
+| **Bloque** | Proyección estructural de un átomo en un documento o archivo | `Block` con `blob_oid: Option<String>` |
+| **Slice** | Snapshot inmutable Merkle-encadenado de un estado de conocimiento | `KronosSlice` en `kronos.rs:61` |
+| **Entity** | Cuerpo de conocimiento evolutivo con su propia historia de slices | `KronosEntity`, `EntityState` |
+| **Layer** | Capa de madurez de un átomo dentro de una entity: `Incoming, Low, Medium, High, Nucleus, Dormant, Deprecated` | `Layer` en `kronos.rs:171` |
+| **Graduation** | Promoción de un átomo de una entity a otra con quality gate y provenance | `GraduationEngine` en `ckl-temporal/src/graduation.rs` |
+| **Provenance** | Registro de origen, sesión, momento y razón de una graduación | `Provenance` en `kronos.rs:856` |
+| **Intent** | Declaración de mutación con provenance obligatoria, único punto de escritura del grafo | `IntentEngine` en `ckl-runtime::protocol` |
+| **CIP Gateway** | Política sealed v0.2.0 que fuerza todas las mutaciones por Intent | `__internal::StorageWrites` en `ckl-core/src/storage.rs` |
+| **blob_oid** | SHA-1 del contenido de un átomo, base de la versión 2 del hash de slice | `Block.blob_oid`, `compute_hash_v2` |
+| **PublisherId** | Identidad criptográfica del emisor de un paquete Aether (firmas Ed25519) | `PublisherId` en `ckl-types` (composite PK, H1) |
+| **Composite PK** | Identidad federada `(PublisherId, BlockId)` que preserva namespacing cross-publisher | Área C / H1 |
+| **PendingRelationship** | Relación con destino externo no resuelto aún; vive con TTL hasta que el publisher destino se monta | Área C / H3 |
+| **SAME_AS** | Variante de `RelationshipType` (47) que afirma equivalencia entre dos átomos; **claim, no verdad** | `ckl-types::RelationshipType` (H5) |
+| **EVOLVES_TO** | Relación entre versiones sucesivas del mismo `BlockId` a través de slices | Área D (propuesta) |
+| **T1 (Bulk)** | Capa de transporte: HTTP estático con CBOR firmado | §10 · Área E |
+| **T2 (Query)** | Capa de transporte: gRPC on-demand con merkle proofs | §10 · Área F |
+| **T3 (Discovery)** | Capa de transporte: registry como publisher recursivo | §10 · Área G |
+| **AetherId** | URI canónico: `aether://<publisher>/<source>/[<slice>/]<block_id>` | §12 |
+
+---
+
+*v0.2 — visión global consolidada. Trilogía conceptual cierra con esta versión; el detalle técnico por Área (D-I) vive en specs dedicados.*

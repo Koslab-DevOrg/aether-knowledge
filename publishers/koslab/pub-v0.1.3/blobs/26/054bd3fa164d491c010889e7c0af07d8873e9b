@@ -1,0 +1,1163 @@
+# Aether v0.4 — Área D: Per-Slice Identity & Temporal Pinning
+
+**Documento de spec por Área · v0.4 · published · Mayo 2026 · Área D CLOSED 2026-05-19**
+
+> Spec dedicada al Área D del roadmap de Aether (§16 de [Aether — Concepto y Principios v0.2](workspace://1177a168-7)). Eleva la identidad temporal de sufijo opcional a **eje canónico del wire**: cualquier referencia a Aether puede ser **viva** (última versión) o **congelada** (versión exacta de un slice firmado).
+
+---
+
+## 0. Cambios respecto a v0.3 (Área C)
+
+| Tema | v0.3 (Área C, shipped PR #118) | v0.4 (Área D, esta spec) |
+|---|---|---|
+| Wire `FORMAT_VERSION` | 4 | **5 (bump estricto, sin retrocompat)** |
+| `AetherId` | 3 segmentos: `pub/source/blk` | **3 o 4 segmentos: `pub/source/[slice/]blk`** |
+| Storage de versiones | Una fila lógica por `(PubId, BlkId)` — vista "viva" implícita | Append-only `block_slice_version` + vista "última" como query |
+| `RelationshipType` | 45 variantes en 11 categorías | **46 variantes en 12 categorías** (`EvolvesTo` + `Temporal`) |
+| Política retención | No declarada (implícita: lo que el publisher tenga) | **Declarada en `SignedManifest` firmado**, default `keep_all` |
+| Resolver H4/H5 | Una sola path (live) | Bifurcado: live path + pinned path |
+| `Intent`s nuevos | — | `Intent::PruneSliceVersions` (con allowlist) |
+
+### 0.0 Changelog v0.1 → v0.2
+
+- **Q3 cerrado** como **D9**: `SliceId` ya existe en `ckl-types::ids` (define_id!, prefix `slc_`); reuso del tipo. Wire parser hace validación estricta `[a-z0-9]{12,32}` (Option B) sobre el body.
+- **Q4 cerrado** como **D10**: nueva `RelationshipCategory::Temporal` confirmada (justificación en §6.1).
+- **D1 reducido en scope**: ya no introduce tipo `SliceId` nuevo; sólo extiende `AetherId` parser.
+- Nota añadida en §2.1 sobre patrones de generación ya en uso en Kronos (`slicer.rs`, `graduation.rs`, `cycle.rs`).
+- Q3 y Q4 retirados de §13 (open questions).
+
+### 0.0.1 Changelog v0.2 → v0.3
+
+- **Q6 cerrado** como **D11**: slice chain por **delta + Merkle proof** (no chain completo), genesis explícito.
+- **D9 revisado** contra el código real de Área C (`ckl-aether-format::lib.rs`):
+  - `AetherId` **ya existe** con `slice_id: Option<String>` (Área C lo dejó plantado). D1 baja un escalón más: es endurecimiento + canonicalización, no introducción de tipo.
+  - `BlockId` en wire **permanece liberal** (`validate_segment`): bodies reales tipo `blk_vkO_Fdc-hrhSUahK` llevan mayúsculas/hyphens/underscores. Mi regex anterior `[a-z0-9]{12,32}` los habría rechazado.
+  - `SliceId` en wire alinea con `validate_identifier` existente: `^[a-z0-9_-]{1,64}$` (mismo shape que `SliceManifest.slice_id` ya enforce). Coherencia, no invento.
+- **§6.4 (storage relationships) clarificado** vs §2.1 (wire endpoints): wire shape uniforme con `slice_id: Option<SliceId>` en endpoint, storage selectivo a `metadata` JSON.
+- **Test 10.9 añadido**: tamper-detect de `retention_policy` strippeada post-firma.
+- Notas de "ya existe en Área C" añadidas a §3.3 y §7.2 (`AetherId`, `validate_segment`, `validate_identifier`).
+
+### 0.0.2 Changelog v0.3 → v0.4
+
+**v0.4 Área D CLOSED (2026-05-19) — Ola 2 polish:**
+
+- **D9 shipped (`157a3ef`):** `Intent::ImportAetherPackage` ahora delega al chain validator (`verify_slice_chain_v04`) ANTES de cualquier escritura de Area C; BSV + `slice_root` quedan persistidas dentro de gates 8-9; `put_block` + `append_provenance` + `put_relationship` + `enqueue_pending_edge` corren post-validador con allowlist gate intercalado. T18 del threat model (`bf6f5e35-d`) flipa 🔴 → 🟢. Bifurcación intent vs subscribe (§6.8) queda cerrada en el sentido fuerte: ambos paths comparten la misma raíz de admisión `verify_slice_chain_v04`. Convergencia descrita en §6.8.2 es ahora la realidad shipped.
+- **D8 shipped (`d779840`):** Mini-funcional E2E con 7 escenarios sobre `Intent::ImportAetherPackage` unificado — chain validator + provenance/grafo + allowlist gate ejercidos simultáneamente desde un único entry point. S4 pinea la semántica de **allowlist deny post-validator** (BSV + slice_root persisten, Area C no — caso (a) del Two-layer invariant §6.9); S6 pinea la **cascade resolve cross-crate** vía `resolve_pending_descendants_of` que llama `verify_slice_chain_v04` directo SIN dispatchear Intent (caso (b) del Two-layer invariant). Convergencia desbloquea Área E.
+- **Two-layer invariant capturado (§6.9 nueva):** D8 reveló que Aether persiste en **dos capas con invariantes independientes** — L1 chain bookkeeping (BSV + slice_root, publisher-attested) y L2 workspace-visible (block + provenance + relationships). L2 puede estar vacía mientras L1 tiene entradas (casos: allowlist deny, cascade resolve post-defer, rate-limit drop futuro). El handler comment de `protocol.rs:2480-2498` es evidencia load-bearing. Threat model `bf6f5e35-d` recibe T19 (🟡, cascade resolve workspace-visibility gap) en bump v0.4.1 → v0.4.2.
+
+**Decisiones cerradas en revisión pre-implementación:**
+
+- **DEC-1 (Q-C cerrado): ordenamiento del chain `EvolvesTo` = topológico-Merkle, NO `published_at`.** El invariante "posterior en el chain" del wire validator (§6.2) y el update flow del importer (§4.3) se resuelven siguiendo `previous_slice_id`/`previous_slice_root` desde el genesis del publisher (D11), no comparando timestamps. Wall-clock `published_at` queda como **señal informativa** sobre la vista "última" (vista convergente) pero **no como criterio de validación** de la cadena. Razón: timestamps son adversarialmente manipulables y la promesa de inmutabilidad por slice se ancla en Merkle, no en relojes.
+- **DEC-2 (Q-D cerrado): el bump v5 se justifica por `RetentionPolicy` + `EVOLVES_TO` + delta Merkle (D11), NO por la shape del URI.** La serialización CBOR de `AetherId` sigue siendo el struct `{ publisher_id, source_id, block_id, slice_id: Option<SliceId> }` heredado de Área C — D1 sólo cambia el **parser/emisor textual** del URI (segmento path en lugar de sufijo `@`). El digest canónico y el wire CBOR de `AetherId` per se no rompen; lo que rompe v4→v5 es el `SignedManifest` con `retention_policy` firmado + `evolves_to_edges` + `merkle_proof`. Aclaración propagada a §3.1.
+- **DEC-3 (Hash-domain version-bump strict reject):** El hash domain forma parte del contrato cripto. Bumping de format version (v4 → v5 en `HASH_DOMAIN`, v1 → v2 en `MANIFEST_HASH_DOMAIN`) implica **reject estricto de versiones inferiores con decode-time check ANTES de tocar firma**. Sin compat shim. Razón: aceptar dos dominios simultáneamente = ventana de cross-version replay. Validadores: `AetherPackage::from_cbor` → `UnsupportedVersion`, `SliceManifest::from_cbor` → `ManifestUnsupportedVersion`. `MIN_SUPPORTED_FORMAT_VERSION=5`, `MIN_SUPPORTED_MANIFEST_VERSION=2`.
+- **DEC-4 (Intent path debe delegar al chain validator — bifurcación descubierta en prep D8):** El handler `Intent::ImportAetherPackage` (`execute_import_aether_package` en `crates/ckl-runtime/src/protocol.rs:2293` → `ckl_aether_client::verify_package` en `crates/ckl-aether-client/src/lib.rs:138-169`) hoy acepta `FORMAT_VERSION=5` pero NO rutea por `verify_slice_chain_v04` ni persiste BSV/`slice_root`. El subscribe path (`ingest_subscribed_slice` en `crates/ckl-aether-client/src/lib.rs:756`) sí rutea por el validator pero NO escribe provenance/blocks/relationships/pending_edges. Esta bifurcación deja al intent path vulnerable a los gates 5-9 que el subscribe path mitiga (genesis forjado, `previous_slice_root` inválido, merkle proof inválido). **Decisión:** el intent path debe converger al chain validator — `Intent::ImportAetherPackage` debe delegar a `verify_slice_chain_v04` ANTES de cualquier escritura, y escribir BSV + `slice_root` + provenance + blocks + relationships + pending_edges en transacción coherente. Razón: "firma + cadena es la garantía, no el entry point"; tener dos handlers con superficies de seguridad disjuntas viola single point of trust. Implementación vivirá en sibling session `260514-long-heron` como hito de convergencia, materializado provisionalmente como **D9** en §9 y descrito en §6.8. Threat model `bf6f5e35-d` recibe **T18** (Intent-path chain validator bypass, 🔴 deuda crítica) en el bump v0.4 → v0.4.1. Convergencia es prerequisito de **D8** (mini-funcional E2E) y de Área E (HTTP transport requiere single import path).
+
+**Open questions parqueadas (no bloquean D3, sí bloquean D4):**
+
+- **Q-A — Genesis attestation:** ¿segunda firma explícita sobre `(publisher_id, slice_id, timestamp)` cuando `genesis=true`, o basta con flag `genesis: true` en el `SignedManifest` ya firmado? Pendiente Sergio + Alex (threat model `bf6f5e35-d` v0.4). Resolver antes de cerrar D4.
+- **Q-B — `Intent::PruneSliceVersions`:** ¿se declara con stub `Unimplemented` para reservar shape en v5, o se difiere completo a post-MVP? Pendiente Sergio. Resolver antes de cerrar D4.
+- **Q-E — Rate-limit per publisher en T1 Bulk:** diferido a Área E (transporte). No bloquea Área D.
+
+**Implementación shipped en este draft:**
+
+- **D1 (PR commit `1dbac76`):** `AetherId` parser canónico 3-o-4-segmentos con `slice` como **path segment** (`aether://pub/source/[slice/]blk`). Forma legacy con sufijo `@` y scheme `aether:` sin `//` rechazadas con variantes precisas (`FormatError::LegacyAtSuffix`, `LegacyAetherScheme`). Validación asimétrica D9: `publisher`/`source`/body de `slice_id` por `validate_identifier`; `block_id` permanece laxo (prefix `blk_` + cap longitud) — coherente con bodies reales tipo `blk_vkO_Fdc-hrhSUahK`. 7 nuevas variantes de `FormatError` + 14 tests nuevos + 7 migrados, todos verdes.
+- **D3 (PR commit `5261dac`):** `RelationshipType::EvolvesTo` (#46) + `RelationshipCategory::Temporal` (#12). `EvolvesTo` clasifica como `Temporal`, `is_epistemic() = false`, `is_symmetric() = false`. Wire key `"EVOLVES_TO"` (SCREAMING_SNAKE) con alias serde `"EvolvesTo"` para tolerancia de entrada. Documentación de la variante incluye nota de DEC-1 explícita ("topological-by-Merkle, **not** wall-clock `published_at`"). 5 tests nuevos + 3 arrays exhaustivos actualizados; `ckl-aether-client::parse_rel_type` extendido.
+
+### 0.1 Por qué Área D antes de E/F/G
+
+Las áreas E (T1 Bulk), F (T2 Query) y G (T3 Discovery) **necesitan el shape final del wire** para diseñar transportes. Cambiar el `AetherId` después de tener T1 desplegado significaría romper mirrors estáticos en producción. Área D bloquea E/F/G por construcción.
+
+### 0.2 Anclas conceptuales
+
+- **Axioma 2** (foto sellada) — [doc 1177a168-7 §3](workspace://1177a168-7) — *"un bloque no tiene una versión, tiene una historia firmada"*.
+- **§12** (identidad temporal explícita) — desarrolla la consecuencia del Axioma 2 en identificadores con eje temporal y `EVOLVES_TO`.
+- **§14** (source-drop, no takedown) — la inmutabilidad por slice hace el takedown criptográficamente imposible; Área D materializa esa promesa.
+- **Decisión MVP #2** (versionado) — el "compromiso post-MVP" de trazabilidad contextual de slices se cierra formalmente aquí.
+
+---
+
+## 1. Contexto y alcance
+
+### 1.1 Objetivo
+
+Convertir el eje temporal de Aether de **opcional** a **ciudadano de primera clase del wire**, sin tocar la identidad federada `(PublisherId, BlockId)` (invariante H1 de Área C).
+
+**Tres propiedades de orden mayor que Área D habilita:**
+
+1. **Trazabilidad de evolución** — saber *cómo* cambió una creencia, no sólo *que* cambió, vía `EvolvesTo` entre versiones del mismo `BlockId`.
+2. **Reproducibilidad de razonamiento** — un agente puede reconstruir el estado de conocimiento en cualquier punto temporal de cualquier publisher.
+3. **Inmunidad a revisionismo** — una cita pinned no puede ser silenciosamente reescrita; los mirrors siguen sirviendo el slice firmado original.
+
+### 1.2 Fuera de alcance (explícito)
+
+- **Forks / branching** de bloques — un publisher que decide divergir su propia historia produce ramas. Out of scope (Área futura).
+- **Selective disclosure** de slices privados (P3 del doc visión).
+- **Convergencia semántica cross-publisher** — `SAME_AS` n-way → Área I.
+- **Optimizaciones de footprint** (window/cadence retention) — diferidas a post-MVP; default es `keep_all` (ver §5).
+- **Migración de paquetes ya publicados v3/v4** — Aether aún no está en producción; el bump v5 es estricto y limpio.
+
+### 1.3 Vocabulario
+
+| Término | Significado |
+|---|---|
+| **Live ref** | `aether://pub/source/blk` (3 segmentos) — resuelve a la última versión publicada. |
+| **Pinned ref** | `aether://pub/source/slice/blk` (4 segmentos) — resuelve al contenido exacto sellado en ese slice. |
+| **`SliceId`** | Identificador opaco del slice. Tipo reusado de `ckl-types::ids:98` (`define_id!(SliceId, "slc_")`). Body en wire: `[a-z0-9]{12,32}` (D9). |
+| **Versión de bloque** | Tupla `(PubId, BlkId, SliceId)`: el contenido que tenía ese bloque en ese slice. |
+| **Cadena de evolución** | Secuencia `EvolvesTo` desde slice_n hasta slice_m del mismo `BlockId`. |
+
+---
+
+## 2. Decisiones tomadas
+
+| # | Decisión | Racional | Ata a |
+|---|---|---|---|
+| **D1** | `AetherId` admite 3 segmentos (live) o 4 segmentos (pinned). Última posición = `BlockId` siempre. | Eje temporal canónico, sin sufijos ambiguos como `@<slice>`. | Axioma 2; §12 doc visión |
+| **D2** | Composite PK `(PubId, BlkId)` invariante; `(PubId, BlkId, SliceId)` sólo para queries pinned. | No romper H1 de Área C. Slice es eje adicional, no reemplazo de identidad federada. | H1 Área C |
+| **D3** | `RelationshipType::EvolvesTo` como variante #46, nueva categoría `Temporal`. | Semántica "mismo BlockId, slice posterior" no existe hoy; `Supersedes` opera cross-block. | §12 doc visión; análisis CKL `relationship.rs` |
+| **D4** | Política de retención declarada en `SignedManifest` firmado (campo `retention_policy`). | Auditable, consistente cross-subscriber, alineado con Axioma 2 ("Wayback Machine criptofirmada", §14). | Axioma 2, 4 |
+| **D5** | Default = `keep_all`. Variantes `window{N}` y `cadence{Duration}` diferidas. | KISS para MVP; evaluar footprint con datos reales antes de optimizar. | KISS |
+| **D6** | `EvolvesTo` es **auto-emitido por el publisher** al sellar el slice nuevo. | Consistencia cross-subscriber. Cualquier inferencia local divergiría entre subscribers con caches diferentes. | Axioma 3 (linaje obligatorio) |
+| **D7** | **Bump `FORMAT_VERSION` 4 → 5 estricto, sin retrocompat**. | Aether aún no está en producción; bump limpio simplifica parser, manifest, tests. | KISS; ausencia de usuarios reales |
+| **D8** | PR único `feat/aether-v0.4` — D1...D7 mergeables juntos. | Cambio coherente; partir en sub-PRs introduce estados intermedios incoherentes (parser nuevo sin storage, etc.). | Coherencia |
+| **D9** | **`SliceId` se reusa** del tipo ya existente en `ckl-types::ids` (define_id!, prefix `slc_`). Wire parser valida estrictamente body con regex `^[a-z0-9]{12,32}$` (Option B). | El tipo ya existe y es usado por Kronos / Area B/C. Validación estricta en wire bloquea cadenas tóxicas en payload firmado, sin endurecer el constructor del tipo (más liberal en runtime interno). | D1; ckl-types::ids:98 |
+| **D10** | Nueva `RelationshipCategory::Temporal` como categoría #12 (alberga a `EvolvesTo` y sucesoras temporales). | `Identity` es simétrica/atemporal; `Inference` es epistémica derivable. La sucesión temporal del mismo `BlockId` no encaja en ninguna existente. | D3; §6.1 |
+| **D11** | Slice chain por **delta + Merkle proof**: cada `SignedManifest` lleva `previous_slice_id`, `previous_slice_root`, `merkle_proof`. Chain completo nunca viaja por el wire; genesis explícito con `genesis: true` y `genesis_attestation`. | Chain completo crece O(N) con #slices; mirror nuevo no debería descargar todo el historial. Merkle permite que cualquier subscriber con *un* slice histórico verifique continuidad. T15 (slice rewrite) queda mitigado para todo subscriber, no solo los que cachearon el slice anterior. | D4; §2.4; T15 |
+
+### 2.1 Justificación de D7 (FORMAT_VERSION bump)
+
+Área C subió de v3 a v4 para acomodar composite PK + provenance + allowlist (ver [Aether v0.3 Área C §2.1](workspace://751102f2-0)). Área D introduce:
+
+- Nuevo campo `slice_id: Option<SliceId>` en endpoints de relaciones cross-package del wire.
+- Nuevo campo `retention_policy: RetentionPolicy` en `SignedManifest`.
+- Nueva variante `RelationshipType::EvolvesTo` (nueva categoría — `Temporal`).
+- Nueva tabla `block_slice_version` con shape append-only (cambio interno del subscriber, no del wire, pero el manifest la describe).
+
+Cualquiera de los tres primeros rompe shape. Bump a 5 es la salida limpia. Como **no hay clientes v4 en producción**, no hay matriz de compatibilidad que mantener.
+
+Tests `trybuild` + E2E enforce:
+- Cliente v5 que recibe `format_version=4` → `Err(WireFormatMismatch { found: 4, expected: 5 })`.
+- Cliente v5 que recibe `format_version=5` con campos faltantes → `Err(WireSchemaInvalid)`.
+
+### 2.2 Justificación de D9 (`SliceId` se reusa)
+
+`SliceId` ya existe en CKL desde antes de Aether:
+
+```rust
+// crates/ckl-types/src/ids.rs:98
+define_id!(SliceId, "slc_");
+```
+
+El macro `define_id!` genera un newtype `pub struct SliceId(pub String)` con `Display`, `From<&str>/From<String>`, `serde(transparent)` y constante `PREFIX = "slc_"`. Es ya usado por:
+
+- **Kronos** — `KronosSlice.id`, `TemporalSlicer`, ciclos de graduación.
+- **Aether Áreas B/C** — `ProvenanceEntry.slice_id`.
+
+**Patrones de generación ya en uso** (no normativos; D9 los respeta como convención):
+
+| Archivo | Patrón | Observación |
+|---|---|---|
+| `kronos/slicer.rs:46` | `format!("slice_{}", &state_hash[..12])` | Hash truncado 12 hex. Prefix legacy (no `slc_`). |
+| `kronos/graduation.rs:334` | `format!("slice_{}", &state_hash[..12])` | Idem. |
+| `kronos/cycle.rs:107` | `format!("seed_{}", &seed_hash[..12])` | Seed, no slice. |
+
+> Deuda pre-existente: algunos sitios usan prefix `slice_` en lugar de `slc_`. **No es objetivo de Área D arreglarlo** (ticket separado). El parser de Aether sólo acepta `slc_<body>` (estricto), por lo que el wire queda limpio aunque el runtime interno tolere ambos.
+
+**Validación en wire (D9 final, v0.3 — alineada a `validate_identifier` existente):**
+
+```rust
+// ckl-aether-format::aether_id parser
+fn parse_slice_id(s: &str) -> Result<SliceId, AetherIdError> {
+    let body = s.strip_prefix("slc_").ok_or(AetherIdError::SliceIdPrefix)?;
+    // Reusa el shape ya enforced por SliceManifest.slice_id: ^[a-z0-9_-]{1,64}$
+    validate_identifier("slice_id", body)
+        .map_err(|_| AetherIdError::SliceIdBodyShape)?;
+    Ok(SliceId(format!("slc_{body}")))
+}
+```
+
+> Razón del cambio respecto a v0.2: la propuesta original `^[a-z0-9]{12,32}$` rechazaba shapes legítimos de Kronos (`slice_xxx` con hash 12 hex) y no se alineaba con `validate_identifier` ya en uso en `SliceManifest`. Reusar > inventar.
+
+El tipo `SliceId` en `ckl-types` mantiene su constructor permisivo (liberal in / strict out): es el **parser del wire** quien rechaza shapes tóxicos.
+
+### 2.3 `AetherId` ya existe (descubierto en v0.3)
+
+Revisión del código de Área C reveló:
+
+```rust
+// crates/ckl-aether-format/src/lib.rs:603
+pub struct AetherId {
+    pub publisher: String,
+    pub source: String,
+    pub block_id: String,
+    pub slice_id: Option<String>,   // ← Área C ya plantó el axis
+}
+
+impl AetherId {
+    pub fn new(publisher, source, block_id, slice_id: Option<String>) -> Result<Self> {
+        validate_segment("publisher", &publisher)?;
+        validate_segment("source", &source)?;
+        validate_segment("block_id", &block_id)?;
+        if let Some(s) = slice_id.as_ref() {
+            validate_segment("slice_id", s)?;
+        }
+        ...
+    }
+}
+```
+
+Y dos validadores asimétricos:
+
+```rust
+// validate_segment — laxo: rechaza vacío, '/', '@'. NO restringe charset.
+fn validate_segment(name, v: &str) -> Result<()> { ... }
+
+// validate_identifier — estricto: ^[a-z0-9_-]{1,64}$
+pub fn validate_identifier(field, value: &str) -> Result<()> { ... }
+```
+
+**Implicaciones para Área D:**
+
+- **D1 ya no introduce `AetherId`**. Se reduce a:
+  1. Asegurar parsing de la forma URI canónica `aether://pub/src/[slice/]blk` (constructor toma 4 strings hoy).
+  2. Endurecer validación según matrix más abajo.
+  3. Garantizar `Display` simétrico al parser.
+
+- **Matriz de validación D9 (revisada con realidad de Área C):**
+
+| Segmento | Validación en wire `AetherId` | Validación en `SliceManifest` |
+|---|---|---|
+| `publisher` | `validate_segment` (laxo, AC) → **endurecer a `validate_identifier`** | `validate_identifier` (ya, AC) |
+| `source` | `validate_segment` (laxo, AC) → **endurecer a `validate_identifier`** | `validate_identifier` (ya, AC) |
+| `block_id` | `validate_segment` (laxo, AC) → **permanece laxo** (BlockIds reales llevan mayúsculas/hyphens) | n/a |
+| `slice_id` | `validate_segment` (laxo, AC) → **endurecer a `validate_identifier`** | `validate_identifier` (ya, AC) |
+
+> **D9 final:** `BlockId` en wire **se queda laxo** (`validate_block_id` ad-hoc: prefix `blk_` + cap longitud + rechazo de `/`/`@`). Los demás segmentos suben a `validate_identifier`. Esto alinea con lo que el manifest ya hace y respeta la realidad de los BlockIds en producción (mixed-case allowed). El test `validate_identifier_unit_cases` (l. 1229) ya cubre la base.
+
+> Mi propuesta v0.2 de regex `^[a-z0-9]{12,32}$` queda **invalidada**. Razón: rechaza ejemplos reales como `blk_vkO_Fdc-hrhSUahK`. Aprendizaje: cuando el código ya existe, alinear > inventar.
+
+### 2.4 Justificación de D11 (slice chain por delta + Merkle)
+
+Cada `SignedManifest` carga la prueba mínima para que un subscriber pueda **verificar la continuidad temporal sin tener el chain completo**:
+
+```rust
+pub struct SignedManifest {
+    // ... campos Área B/C/D existentes ...
+    pub slice_id: SliceId,
+    pub previous_slice_id: Option<SliceId>,           // None = genesis
+    pub previous_slice_root: Option<MerkleRoot>,      // None = genesis
+    pub merkle_proof: Vec<MerkleNode>,                // [] = genesis
+    pub genesis: bool,                                 // true sólo para el primer slice
+    pub genesis_attestation: Option<Signature>,        // requerida iff genesis=true
+}
+```
+
+**Verificación en subscriber al importar `slc_43`:**
+
+1. Si `genesis=true`: verifica `genesis_attestation` con publisher key. Acepta como raíz de cadena.
+2. Si `genesis=false`: requiere haber visto antes algún `slc_K` con `K ≤ previous_slice_id`. Reconstruye `previous_slice_root` desde los slices verificados, lo compara contra el campo declarado.
+3. Verifica `merkle_proof` desde el digest del nuevo manifest hasta `previous_slice_root`.
+4. Rechazo: `Err(SliceChainBroken { expected_prev_root, got_prev_root })`.
+
+**Por qué Merkle y no chain hash plano (estilo blockchain):**
+
+- Hash plano = cada slice tiene `previous_slice_digest`. Cadena lineal. Verificar continuidad de `slc_1 → slc_100` sin todos los slices intermedios es **imposible**.
+- Merkle proof = cada slice puede ser verificado contra cualquier raíz histórica conocida. Un mirror que llega con sólo `slc_50` puede recibir `slc_100` y verificarlo si publisher emite proof `slc_100 → root(slc_50)`.
+
+**Genesis explícito:** evita ataques tipo "fake genesis con history reescrita". El primer slice de un publisher requiere firma adicional (`genesis_attestation`) sobre el `publisher_id` + `slice_id` + `timestamp`. Subscribers cachean los genesis attestations vistos; rechazo de segundo genesis para el mismo publisher.
+
+**Coste wire:** ~32 bytes (root) + log₂(N) × 32 bytes (proof). Para N=10k slices: ~480 bytes. Aceptable.
+
+```mermaid
+graph LR
+    G["slc_0 (genesis)<br/>genesis=true<br/>attestation: sig"] -->|prev_root=h0| S1["slc_1<br/>prev=slc_0<br/>proof=[]"]
+    S1 -->|prev_root=h1| S2["slc_2<br/>prev=slc_1<br/>proof=[h0]"]
+    S2 -->|prev_root=h2| S100["slc_100<br/>prev=slc_99<br/>proof=[h0..h98]"]
+    style G fill:#1a4731,stroke:#5fb3a1,color:#fff
+```
+
+---
+
+## 3. Wire change — `AetherId` extendido
+
+### 3.1 Gramática URI canónica
+
+```
+aether-id     = "aether://" publisher "/" source "/" [ slice "/" ] block
+publisher     = publisher-id           ; PublisherId, base32-like
+source        = source-slug            ; humano-legible, slug del publisher
+slice         = slice-id               ; opaco (Q3)
+block         = block-id               ; "blk_" prefix + body
+```
+
+**Regla de parsing:** la última posición es **siempre `BlockId`**. Si hay 4 segmentos, el penúltimo es `SliceId`; si hay 3, no hay slice (live ref).
+
+> **Shape CBOR estable (DEC-2, v0.4):** la gramática de arriba describe la **forma textual** del URI (parser/emisor), no la serialización binaria. El CBOR de `AetherId` permanece como el struct `{ publisher_id, source_id, block_id, slice_id: Option<SliceId> }` heredado de Área C — D1 no toca el digest canónico ni el wire CBOR del propio `AetherId`. El bump `FORMAT_VERSION` 4→5 se justifica por el `SignedManifest` extendido (`retention_policy` firmado §5, `evolves_to_edges` §6.3, `merkle_proof`/`previous_slice_root` §7-D11), **no por la shape del URI**. Consecuencia: el cambio v5 es estricto en `SignedManifest`, no en `AetherId` per se.
+
+```mermaid
+stateDiagram-v2
+    [*] --> ParseScheme
+    ParseScheme --> ParseAuthority: "aether://"
+    ParseAuthority --> ParsePath: publisher
+    ParsePath --> Seg1: "/source"
+    Seg1 --> Seg2: "/X"
+    Seg2 --> Live: end (3 segs)
+    Seg2 --> Seg3: "/Y"
+    Seg3 --> Pinned: end (4 segs)
+    Seg3 --> Invalid: extra segs
+    Live: aether://pub/source/blk (X=block)
+    Pinned: aether://pub/source/slice/blk (X=slice, Y=block)
+```
+
+### 3.2 Ejemplos
+
+| URI | Tipo | Significado |
+|---|---|---|
+| `aether://koslab/ckl-spec/blk_pk` | live | "lo último que diga KOSLAB sobre `blk_pk`" |
+| `aether://koslab/ckl-spec/slc_42abc/blk_pk` | pinned | "el contenido exacto que `blk_pk` tenía cuando KOSLAB selló `slc_42abc`" |
+| `aether://koslab/ckl-spec/blk_pk/extra` | inválido | última posición debe ser `BlockId` (prefix `blk_`) |
+| `aether://koslab/ckl-spec/` | inválido | falta `BlockId` |
+
+### 3.3 Validación en parser (revisado v0.3 — D9 alineado a Área C)
+
+| Segmento | Prefix | Shape body | Validador |
+|---|---|---|---|
+| `publisher` | (sin prefix) | `^[a-z0-9_-]{1,64}$` | `validate_identifier` |
+| `source` | (sin prefix) | `^[a-z0-9_-]{1,64}$` | `validate_identifier` |
+| `slice_id` | `slc_` | `^[a-z0-9_-]{1,64}$` (sobre el body después del prefix) | `validate_identifier` |
+| `block_id` | `blk_` | **Permanece laxo**: rechazar sólo vacío, `/`, `@`; cap longitud `MAX_IDENTIFIER_LEN` | `validate_block_id` (ad-hoc) |
+
+Razones para la asimetría sobre `BlockId`:
+- BlockIds reales en CKL usan mixed-case + hyphens + underscores (ej. `blk_vkO_Fdc-hrhSUahK`).
+- Endurecer aquí rompería referencias a bloques ya creados.
+- La integridad del bloque se asegura por `blob_oid` / `content_hash` / firma del manifest, no por shape del id.
+- El prefix `blk_` y el cap de longitud son suficientes para anti-injection.
+
+**Rechazos típicos:**
+- `aether://koslab/ckl-spec/SLC_ABC/blk_pk` → `Err(AetherIdError::SliceIdBodyShape)` (mayúscula en slice).
+- `aether://KosLab/ckl-spec/blk_pk` → `Err(AetherIdError::PublisherShape)` (mayúscula en publisher).
+- `aether://koslab/ckl-spec/blk_x/extra` → `Err(AetherIdError::TooManySegments)`.
+
+El tipo `SliceId` en `ckl-types` sigue siendo liberal (compatibilidad con prefijos legacy de Kronos `slice_xxx`). La estrictez vive en la frontera del wire (`AetherId` parser + `SliceManifest` validator).
+
+### 3.4 Aliases legacy
+
+Forma sin scheme `aether:pub/source/blk` deja de soportarse en v5. Tests `trybuild` verifican que el parser rechaza.
+
+---
+
+## 4. Storage model
+
+### 4.1 Invariante: tabla `block` no cambia
+
+PK lógico `(publisher_id, block_id)` se mantiene. La tabla `block` sigue representando **la última versión conocida** del bloque desde la perspectiva del subscriber.
+
+### 4.2 Nueva tabla `block_slice_version` (append-only) — PK 4-tuple shipped
+
+> **Realidad shipped (post-`ee1485b` P1):** el PK de BSV es **4-dim** `BlockSliceVersionKey { publisher, source, block, slice }`, no 3-dim como el draft original suponía. Razón: **cross-source isolation** — el mismo `block_id` puede aparecer bajo distintos `source_id` del mismo publisher (caso real de Áreas C/D) y necesitan filas distintas. El retrofit a 4-tuple cierra P1 (cross-source isolation). El cross-publisher test y los 36 BSV tests pinean este contrato.
+
+```rust
+// crates/ckl-types/src/block_slice_version.rs (shipped)
+pub struct BlockSliceVersionKey {
+    pub publisher: PublisherId,
+    pub source:    SourceId,
+    pub block:     BlockId,
+    pub slice:     SliceId,
+}
+```
+
+**Nota deliberada — BSV NO tiene `entity_id`** (ver doc-comment en `block_slice_version.rs:18-22`):
+- (a) `entity` es 1:1 con `source` para Aether sources por construcción.
+- (b) `Block` tampoco carga `entity_id` — añadirlo a BSV sólo introduce desincronización.
+- La **entity-isolation** ya la enforce **gate 5 del validator** vía `SliceRootKey` 4-tuple (ver §4.6 y §6.7), que sí incluye `entity`.
+
+```sql
+-- Representación lógica (storage real es SurrealKV namespace, no SQL)
+CREATE TABLE block_slice_version (
+    publisher_id        TEXT NOT NULL,
+    source_id           TEXT NOT NULL,      -- ← añadido (4-tuple)
+    block_id            TEXT NOT NULL,
+    slice_id            TEXT NOT NULL,
+    blob_oid            TEXT NOT NULL,
+    content_hash        TEXT NOT NULL,
+    fingerprint         TEXT NOT NULL,
+    published_at        INTEGER NOT NULL,
+    supersedes_slice_id TEXT,
+    imported_at         INTEGER NOT NULL,
+    PRIMARY KEY (publisher_id, source_id, block_id, slice_id)
+) WITHOUT ROWID;
+
+CREATE INDEX idx_bsv_latest
+    ON block_slice_version (publisher_id, source_id, block_id, published_at DESC);
+```
+
+**Propiedades:**
+- **Append-only:** una vez insertada una fila, no se modifica. El delete sólo lo hace `Intent::PruneSliceVersions` con allowlist (ver §5).
+- **Vista "última versión":** query `SELECT ... WHERE publisher_id=? AND source_id=? AND block_id=? ORDER BY published_at DESC LIMIT 1`.
+- **Cadena `EVOLVES_TO`:** se reconstruye siguiendo `supersedes_slice_id`. El edge canónico vive además en la tabla `relationships` con `rel_type='EVOLVES_TO'` (D3).
+- **Persistencia idempotente:** `try_put_block_slice_version_idempotent` retorna **P2 tri-state** — *nuevo* / *idempotent-replay* (mismos bytes) / *conflict* (mismo PK, bytes distintos → `ChainBlockSliceConflict`).
+
+### 4.3 Relación entre `block` y `block_slice_version`
+
+- `block` apunta lógicamente a la fila más reciente de `block_slice_version` por `(pub_id, blk_id)` **en orden topológico-Merkle del slice chain del publisher** (DEC-1, v0.4).
+- Update flow al importar un paquete con slice nuevo:
+  1. Insert en `block_slice_version`.
+  2. **Si el nuevo slice es posterior al `block.slice_id_current` en la cadena Merkle del publisher** (verificable siguiendo `previous_slice_id`/`previous_slice_root` desde el genesis, D11) → update `block` (reemplaza vista "viva"). El campo `published_at` se guarda como metadato informativo pero **no decide** la sustitución.
+  3. Insert relación `EVOLVES_TO` desde fila anterior (si existía) hacia la nueva.
+
+> **DEC-1 — por qué orden topológico-Merkle, no `published_at`:** `published_at` es un timestamp adversarialmente manipulable (el publisher puede backdatear o forward-datear su propio reloj). La cadena Merkle (D11) es ancla criptográfica firmada en el `SignedManifest`: un slice no puede pretender ser "posterior" sin exhibir un `merkle_proof` válido que lo conecte con el chain ya conocido. Esto preserva la "inmunidad a revisionismo" (§1.1.3) incluso ante publishers maliciosos sobre su propio chain.
+
+### 4.4 Migración
+
+Aether v3/v4 no está en producción. **No hay backfill operacional**. Tests sí incluyen seed sintético: para cada `Block` existente en fixtures de tests, insertar una fila en `block_slice_version` con `slice_id = "slc_genesis"` y `supersedes_slice_id = NULL`.
+
+### 4.5 Coste
+
+Storage crece linealmente con #slices × #blocks. Con `keep_all` default es responsabilidad del subscriber/publisher dimensionar. Open Q5 (§13) anota la discusión de optimización post-MVP.
+
+### 4.6 Namespace `slice_roots::` + `SliceRootKey` (shipped D4)
+
+Cada slice persistido produce un `slice_root` (32 bytes, `SLICE_ROOT_LEN = 32`) indexado bajo el namespace SurrealKV `slice_roots::` con clave 4-tuple:
+
+```rust
+// crates/ckl-types/src/slice_root.rs (shipped)
+pub const SLICE_ROOT_LEN: usize = 32;
+
+pub struct SliceRootKey {
+    pub publisher: PublisherId,
+    pub source:    SourceId,
+    pub entity:    EntityId,    // ← presente aquí (BSV NO la lleva, §4.2)
+    pub slice:     SliceId,
+}
+```
+
+**Append-only estricto — duplicate con MISMO valor TAMBIÉN dispara `AppendOnlyViolation`.**
+Esta es una **decisión deliberada**: el contrato fuerza al layer de ingest a hacer dedup explícito vía `try_put_slice_root_idempotent` (P2 tri-state: *nuevo* / *idempotent-replay* / *conflict*). Aceptar duplicados silenciosamente en la primitiva append-only enmascararía double-import bugs en el ingest. La idempotencia se localiza en un solo punto auditable, no se difunde.
+
+**Función en el chain validator (ver §6.7):**
+- **Gate 5** hace lookup de `previous_slice_root` por `SliceRootKey` 4-tuple (entity-isolation aquí).
+- **Gate 6a/6b** verifica `merkle_proof` contra ese `previous_slice_root` y cross-checkea las hojas contra BSVs persistidos.
+- **Gate 9** persiste el nuevo `slice_root` vía `try_put_slice_root_idempotent`.
+- **Gate 7** (`gate_double_genesis`) escanea este namespace por (publisher, source) para confirmar que no existe ya un slice_root con `genesis=true` antes de aceptar un nuevo génesis.
+
+---
+
+## 5. Política de retención
+
+### 5.1 Campo en `SignedManifest`
+
+```rust
+#[derive(Serialize, Deserialize)]
+pub struct SignedManifest {
+    // ... campos existentes Área B/C ...
+    pub retention_policy: RetentionPolicy,   // ← nuevo en v5
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum RetentionPolicy {
+    /// Default v0.4. Guarda todas las versiones para siempre.
+    KeepAll,
+    /// Reserved para post-MVP. No implementado en v0.4.
+    Window { max_versions: u32 },
+    /// Reserved para post-MVP. No implementado en v0.4.
+    Cadence { every_seconds: u64 },
+}
+```
+
+### 5.2 Semántica del contrato
+
+- La declaración va **firmada por el publisher**. Es promesa pública.
+- El subscriber **puede guardar más localmente** (cache adicional). No puede guardar menos sin perder garantías de resolver pinned refs.
+- Si el publisher rompe su propia política (ej. declara `KeepAll` y luego no sirve un slice antiguo) → **evidencia firmada** auditable. Análogo a doble-firma de §14 doc visión.
+
+### 5.3 Default y opciones futuras
+
+| Modo | v0.4 | Notas |
+|---|---|---|
+| `KeepAll` | ✅ activo | Default para todos los manifests v5. |
+| `Window { N }` | reservado | Variantes serdeables; parser acepta pero runtime no las aplica. Tests E2E verifican rechazo controlado. |
+| `Cadence { every }` | reservado | Igual. |
+
+### 5.4 GC operacional (`Intent::PruneSliceVersions`)
+
+Aunque default sea `KeepAll`, el `Intent` existe para casos futuros y para test fixtures:
+
+```rust
+Intent::PruneSliceVersions {
+    publisher_id: PublisherId,
+    block_id: BlockId,
+    keep_slices: Vec<SliceId>,   // allowlist explícita
+}
+```
+
+Reglas:
+- Sólo puede ejecutarse si la política vigente del publisher lo permite (`Window` o `Cadence`). Con `KeepAll` el intent retorna error.
+- Las filas eliminadas se marcan en una tabla `pruned_slices` (publisher_id, block_id, slice_id, pruned_at) para que `resolve_pinned` pueda retornar `Tombstone` en lugar de "not found".
+- Una pinned ref a un slice prunado → `Resolver::resolve_pinned(...) -> Tombstone(slice_id)`.
+
+### 5.5 Mermaid: tabla decisión
+
+```mermaid
+graph TD
+    A[Cliente pide pinned ref] --> B{¿slice existe en block_slice_version?}
+    B -->|sí| C[Return content]
+    B -->|no| D{¿slice está en pruned_slices?}
+    D -->|sí| E[Return Tombstone]
+    D -->|no| F[Return NotFound: pull-on-demand]
+    F --> G{¿publisher sirve el slice?}
+    G -->|sí| H[Verify firma, import, return]
+    G -->|404| I[Return NotFound]
+```
+
+### 5.6 Cola `PendingSlice` (D5 shipped — driver del único terminal-recoverable de §6.7)
+
+> Sección añadida en v0.4 para documentar la realidad shipped del ciclo D5 (PendingSlice + resolver BFS). El usuario nombró esta sección como §5.5 en el brief; se conserva §5.5 (tabla decisión retención) y se publica D5 como §5.6 para no romper anchors.
+
+**Tipo (shipped):**
+
+```rust
+// crates/ckl-types/src/pending_slice.rs
+pub struct PendingSlice {
+    pub id:           PendingSliceId,   // psl_<12hex>, derivado de IDENTIDAD (NO payload)
+    pub identity:     PendingIdentity,  // (publisher, source, entity, slice)
+    pub payload_cbor: Vec<u8>,
+    pub inserted_at:  u64,
+    pub attempts:     u32,
+    pub waiting_on:   SliceRootKey,     // qué slice_root nos falta
+    pub ttl_secs:     u64,              // 7d default
+}
+```
+
+- **`PendingSliceId`** se deriva sólo de la identidad → re-enqueue con tamper de payload = **upsert determinista**, no leak ni inflation de la cola.
+
+**Codec (versioned, anti-corrupt):**
+
+- `PENDING_PAYLOAD_FORMAT_VERSION: u8 = 1` — byte tag prefix antes del CBOR.
+- Decoder distingue **error de versión** (`PendingPayloadError::UnsupportedVersion { found, expected }`) vs **error de corrupción** — la primera variante permite al caller manejar blobs v0.5-en-cola-v0.4 sin confundirlos con corruption.
+
+**Storage (SurrealKV, 3 namespaces atómicos):**
+
+| Namespace | Rol |
+|---|---|
+| `pending_slices::` | Primary store por `PendingSliceId` |
+| `pending_slice_by_predecessor::` | Índice `SliceRootKey (waiting_on) → PendingSliceId` |
+| `pending_slice_by_age::` | Índice `inserted_at` para FIFO eviction |
+
+- **Zero collision con H3 `PendingEdge`** (verificado por test).
+- **Enqueue atómico** = single-txn (primary + 2 índices en la misma transacción).
+
+**Drain (2-txn pattern, NO single-txn snapshot+remove):**
+
+1. **TXN ReadOnly:** scan `pending_slice_by_predecessor::` por `SliceRootKey` recién persistido → lista de candidatos.
+2. **TXN ReadWrite:** intenta re-validar cada candidato; on success/terminal-non-recoverable → delete de primary + 2 índices.
+
+- **Race window documentada:** entre TXN1 y TXN2, otro resolver concurrente puede tomar el mismo candidato. **Tolerado** porque las primitivas de gate 8/9 son **P2 tri-state idempotentes** — el trabajo CPU se duplica, no la escritura ni el state. Sin leak, sin corrupción.
+
+**Resolver (BFS, anti-cascade):**
+
+- **BFS, NO recursión** (evita stack overflow ante cadenas largas).
+- Cap `PENDING_SLICE_CASCADE_HOP_CAP = 64` por trigger.
+- **Counters de observabilidad:**
+  - `pending_slice_cascade_capped_total` (cuántos drains tocaron el cap)
+  - `pending_slice_terminal_resolve_total` (cuántos pendientes se resolvieron terminalmente)
+
+**Matriz de re-validación al drain:**
+
+| Outcome del re-validate | Acción |
+|---|---|
+| `Ok(_)` | **Drop** (delete primary + índices) |
+| `ChainOrphanPreviousSlice` | **Re-enqueue** preservando `inserted_at`, `attempts += 1`, **`waiting_on` auto-corregido** (self-heal ante chain drift del publisher) |
+| `StorageBackendFailure { .. }` | Re-enqueue + counter `pending_slice_backend_retry_total` |
+| Cualquier otro terminal | **Drop** + log estructurado + counter `pending_slice_terminal_drop_total` |
+
+**TTL / cap / eviction (shipped v0.4):**
+
+- TTL = **7 días**.
+- Cap **global = 10 000**, **per-(pub, src) = 1 000**.
+- Eviction = **FIFO** sobre `pending_slice_by_age::`.
+- **Nota — v0.4 ship solo expone `evict_lru_pending_slices(max_entries)` global.** La primitiva per-source `evict_lru_pending_slices_for_source` está en **backlog v0.4.x** (driver natural: Área E cuando T1 Bulk rate-limit requiera quotas per-publisher para aislar publishers maliciosos vs legítimos).
+
+**Wired en ambos entry points:**
+
+- `import_slice` — happy path enqueue cuando el validator retorna `ChainOrphanPreviousSlice`.
+- `ingest_subscribed_slice` — arm `Ok(_)` dispara drain de candidatos cuya `waiting_on` matchea el `SliceRootKey` recién persistido.
+
+**`IngestOutcome` shipped:**
+
+```rust
+pub enum IngestOutcome {
+    Imported(ChainValidationOutcome),
+    Deferred { pending_id: PendingSliceId, waiting_on: SliceRootKey },
+}
+```
+
+- **No carga `attempts`** — la observabilidad de retries vive en el reconciler / counters, no en el outcome estructurado.
+
+---
+
+## 6. EVOLVES_TO — relación temporal nativa
+
+### 6.1 Variante y categoría
+
+```rust
+// crates/ckl-types/src/relationship.rs
+pub enum RelationshipType {
+    // ... 45 variantes existentes ...
+    EvolvesTo,   // #46 (nueva)
+}
+
+pub enum RelationshipCategory {
+    // ... 11 categorías existentes ...
+    Temporal,    // #12 (nueva)
+}
+
+impl RelationshipType {
+    pub const fn category(&self) -> RelationshipCategory {
+        match self {
+            // ... casos existentes ...
+            EvolvesTo => RelationshipCategory::Temporal,
+        }
+    }
+}
+```
+
+**Por qué nueva categoría `Temporal` (decisión D10) y no reusar categorías existentes:**
+
+| Categoría existente | Por qué NO encaja |
+|---|---|
+| `Identity` (`SameAs`, `EquivalentTo`, `DifferentFrom`) | Afirma equivalencia de referente — **simétrica** y **atemporal**. `EvolvesTo` es asimétrica y temporal. |
+| `Inference` (`Supersedes`, `DerivedFrom`, `Refutes`...) | Es **epistémica** y suele ser derivable. `EvolvesTo` es **ontológica** (estado real del bloque a lo largo del tiempo), no derivada de razonamiento. |
+| `Flow` (`Precedes`, `Triggers`...) | Es procedural/operacional. `EvolvesTo` no es flujo de proceso, es historia del mismo identificador. |
+| `Causal` | Sucesión causal entre entidades distintas; `EvolvesTo` es la misma entidad cambiando. |
+
+`Temporal` queda como categoría #12, **asimétrica**, **ontológica** (no epistémica), y reservada para relaciones que tengan al eje temporal como dimensión primaria. `EvolvesTo` es el primer ciudadano; futuras `SupersedesSlice`, `RolledBackTo`, etc. caben aquí sin contaminar `Identity` / `Inference`.
+
+Mezclarlas confundiría la query API (`is_symmetric()`, `is_epistemic()`, `category()`) y enturbiaría la semántica.
+
+### 6.2 Endpoints y semántica
+
+`EvolvesTo` es la única `RelationshipType` que exige el segmento `slice` en sus endpoints. Esto fuerza el shape del wire:
+
+```rust
+// Wire del relationship cuando rel_type = EvolvesTo
+{
+    "rel_type": "EVOLVES_TO",
+    "source": { "publisher_id": "koslab", "block_id": "blk_pk", "slice_id": "slc_42" },
+    "target": { "publisher_id": "koslab", "block_id": "blk_pk", "slice_id": "slc_43" },
+    ...
+}
+```
+
+Invariantes verificadas por el wire validator:
+- `source.publisher_id == target.publisher_id` (mismo publisher).
+- ~~`source.block_id == target.block_id`~~ **[DROPPED v0.4.1]** — Los block_ids son únicos por diseño: un bloque evolucionado tiene un ID distinto del original. El linaje se reconstruye exclusivamente vía la edge `EvolvesTo` (la relación es la fuente de verdad, no la igualdad de ID). Esta constraint contradecía el modelo de datos y se eliminó del validador (commit `83721a7`, PDA-5).
+- `source.slice_id != target.slice_id` (sucesión real).
+- **`target.slice_id` es posterior a `source.slice_id` en el orden topológico-Merkle del slice chain del publisher** (DEC-1, v0.4) — verificable siguiendo `previous_slice_id`/`previous_slice_root` desde el genesis (D11). `published_at` **no es criterio de validación**: dos slices con el mismo timestamp o con timestamps inconsistentes con el chain Merkle siguen siendo válidos mientras el chain sea coherente.
+
+Cualquier `EvolvesTo` que viole estos invariantes → paquete rechazado con `Err(WireInvariantViolation::EvolvesToShape)` (shape) o `Err(WireInvariantViolation::EvolvesToOrdering)` (chain Merkle no establece `target` como descendiente de `source`).
+
+> **Wire shape uniforme, storage selectivo (clarificación v0.3):** el endpoint struct del wire **siempre** lleva `slice_id: Option<SliceId>` (presente en todas las relaciones, `None` salvo `EvolvesTo`). Esto mantiene shape estable en serde y evita matching especial por `rel_type` en el parser. En el storage (§6.4), no se añaden columnas — el `slice_id` viaja en `metadata` JSON sólo cuando es relevante. Las dos vistas coexisten sin contradicción: wire uniforme + DB selectivo.
+
+### 6.3 Quién la emite (D6) — **RESOLVED: EvolvesTo viaja por `AetherPackage.relationships[]`**
+
+> **Resuelto v0.4 (shipped):** las relaciones temporales (`RelationshipType::EvolvesTo`) **NO son un campo separado del manifest** — viajan como cualquier otra relación dentro del package, en `relationships: Vec<RelationshipEntry>`. No existe un campo dedicado `evolves_to_edges: Vec<EvolvesToEdge>` en `SliceManifest` y **no debe existir**. Drafts anteriores sugerían el campo dedicado; queda formalmente descartado.
+
+**Por qué un campo dedicado sería redundante (double-signing):**
+
+- La firma del manifest cubre transitivamente las relaciones porque `manifest.package_hash` referencia el package completo, y `SignedManifest` firma `manifest_digest`. Cualquier mutación en `relationships[]` rompe el digest.
+- Discriminar `EvolvesTo` de otras relaciones es responsabilidad del **importador** consumiendo el enum `RelationshipType` — no del wire shape.
+
+**Si en el futuro se requiere filtrado/indexado eficiente de cadenas temporales,** se resuelve con un **índice secundario en storage** (subscriber-local) — no cambiando el wire.
+
+**Canónica (D6 reconfirmada):** el publisher emite las `EvolvesTo` al sellar el slice nuevo. El subscriber, al importar el package:
+
+1. Verifica firma del manifest y del package (manifest_digest cubre el package completo).
+2. Itera `package.relationships[]` y discrimina por `rel_type`.
+3. Para cada `EvolvesTo`: crea fila en `relationships` con `rel_type='EVOLVES_TO'` y endpoints completos (incluyendo `slice_id` en metadata — ver §6.4).
+
+### 6.4 Almacenamiento de `slice_id` en `relationships`
+
+**Decisión:** no añadir columnas a `relationships`. El `slice_id` de los endpoints se serializa en el campo `metadata: Option<String>` ya existente, en JSON canónico:
+
+```json
+{"source_slice": "slc_42", "target_slice": "slc_43"}
+```
+
+**Razón:** sólo `EvolvesTo` (1 de 46 variantes) usa el eje temporal en endpoints. Añadir 2 columnas `source_slice_id`, `target_slice_id` a una tabla que las usa <2% del tiempo es waste. Si más variantes temporales aparecen post-D, se promueve a columna.
+
+Helper en runtime:
+```rust
+impl Relationship {
+    pub fn slice_endpoints(&self) -> Option<(SliceId, SliceId)> {
+        if self.rel_type != RelationshipType::EvolvesTo { return None; }
+        let meta: Value = serde_json::from_str(self.metadata.as_ref()?).ok()?;
+        Some((meta["source_slice"].as_str()?.into(), meta["target_slice"].as_str()?.into()))
+    }
+}
+```
+
+### 6.5 Diferencia con SUPERSEDES y SAME_AS
+
+| Relación | Cross-block | Cross-slice | Categoría | Cuándo usarla |
+|---|---|---|---|---|
+| `Supersedes` | ✅ (blk_A → blk_B, distintos) | ❌ (no aplica) | Inference | Spec v2 (nuevo BlockId) reemplaza spec v1 (otro BlockId) |
+| `EvolvesTo` | ❌ (mismo blk_X) | ✅ (slice_n → slice_n+k) | **Temporal (nueva)** | Mismo bloque lógico, contenido evoluciona |
+| `SameAs` | ✅ (blk_A ≡ blk_B) | ❌ | Identity | Dos bloques denotan el mismo referente |
+| `DerivedFrom` | ✅ | ❌ | Inference | Linaje conceptual ("nació de") |
+
+### 6.6 Cadena lineal por defecto
+
+Cada bloque tiene **una cadena `EvolvesTo` lineal**: `slc_40 → slc_41 → slc_42 → ...`. Bifurcaciones (forks) están fuera de scope. Si un publisher quiere divergir, debe crear un nuevo `BlockId` con `Supersedes` apuntando al antiguo — fuera del eje `EvolvesTo`.
+
+```mermaid
+graph LR
+    V40["blk_pk @ slc_40<br/>v0.1"] -->|EVOLVES_TO| V41["blk_pk @ slc_41<br/>v0.2"]
+    V41 -->|EVOLVES_TO| V42["blk_pk @ slc_42<br/>v0.3"]
+    V42 -->|EVOLVES_TO| V43["blk_pk @ slc_43<br/>v0.4"]
+    style V43 fill:#1a4731,stroke:#5fb3a1,color:#fff
+```
+
+### 6.7 Wire validator: `verify_slice_chain_v04` (D4 shipped — 9 gates, 13 errors, INSIGHT H3)
+
+> Sección añadida en v0.4 para documentar la realidad shipped del validator. El brief del usuario lo nombra "§6 (validator)"; se publica como **§6.7** porque la categoría conceptual (validación de la cadena de slices incluyendo edges `EVOLVES_TO`) encaja dentro de §6.
+
+#### 6.7.1 Los 9 gates (orden fijo)
+
+| # | Gate | Sync? | Rol |
+|---|---|---|---|
+| **1-4** | Estructurales sobre el manifest | sync, puras | Validan shape e invariantes intra-manifest. Particionan los Q-A failures vía sub-enum `GenesisInvariantReason`. |
+| **5** | Lookup de `previous_slice_root` | async | Resuelve por `SliceRootKey` 4-tuple `(publisher, source, entity, slice)` en namespace `slice_roots::` (§4.6). **Si `genesis=true` está set, salta 5+6 y va a 7.** |
+| **6** | Merkle proof check (sub-dividido **6a/6b**) | async | **6a:** verifica `merkle_proof` contra `previous_slice_root` (puro cripto). **6b:** cross-checkea las **hojas del proof contra BSVs persistidos** (§4.2) — fail con `ChainProofLeafUnknown` si alguna hoja no aparece en el store. |
+| **7** | `gate_double_genesis` (solo génesis) | async | Scan de namespace `slice_roots::` por `(publisher, source)` confirmando que no existe ya un `slice_root` con `genesis=true`. **Fires por construcción ante CUALQUIER segundo génesis** — ver INSIGHT H3 abajo. |
+| **8** | Persist BSV | async | `try_put_block_slice_version_idempotent` → **P2 tri-state** (nuevo / idempotent-replay / conflict). |
+| **9** | Persist `slice_root` | async | `try_put_slice_root_idempotent` → mismo P2 tri-state. Único punto donde un slice queda **canónicamente comprometido**. |
+
+#### 6.7.2 `ChainValidationError` — 13 variants (estables en v0.4, no se planea expansión)
+
+| Categoría | Variants |
+|---|---|
+| **Estructural (gates 1-4)** | `ChainGenesisInvariantViolation { reason: GenesisInvariantReason }`, más variants estructurales del manifest |
+| **Cripto/predecesor (gates 5-6)** | `ChainOrphanPreviousSlice` **(ÚNICA recoverable** — driver de la cola PendingSlice §5.6**)**, `ChainProofInvalid`, `ChainProofLeafUnknown` |
+| **Génesis (gate 7)** | `ChainDuplicateGenesis` |
+| **Persistencia (gates 8-9)** | `ChainBlockSliceConflict`, `ChainSliceRootConflict` |
+| **Backend (cualquier gate async)** | `StorageBackendFailure { step: u8, source: StorageError }` con `#[source]` chain. **Steps reservados:** `5, 6, 7, 8, 9` (Área D) + `10, 11` (Área D5 — enqueue/drain de pending_slice) |
+
+**Recoverability summary:** sólo `ChainOrphanPreviousSlice` es **terminal-recoverable** (alimenta enqueue en la cola PendingSlice). Todos los demás son terminales no-recoverable (drop + log + counter) excepto `StorageBackendFailure` que es retryable.
+
+#### 6.7.3 INSIGHT H3 (load-bearing — MUST documentar)
+
+> **Bajo el orden gate 8 (BSV) → gate 9 (slice_root), el ÚNICO replay idempotent posible para un slice génesis es el caso degenerate donde gate 9 persistió pero el caller no recibió OK.**
+
+En todos los demás casos, `gate_double_genesis` (gate 7) **fires y DEBE fire**. Distinguir A1 (replay-attack legítimo) de H3 (retry legítimo del propio publisher) requeriría **byte-compare del paquete completo en gate 7** — tampering surface inaceptable porque obligaría a mantener el paquete previo bit-a-bit en memoria/storage solo para diffing.
+
+**El contrato NO soporta replay de génesis-con-contenido.** Sólo del `slice_root` como única escritura persistida (el degenerate H3). Cualquier intento de re-emitir un génesis con payload → `ChainDuplicateGenesis` (terminal, no recoverable, **deseado**).
+
+**Implicación arquitectural para Área D5 (PendingSlice):** la transición `pending → real` debe hacer **cleanup atómico ANTES del import-real**. Si quedara un PendingSlice con la misma identidad y luego entra el real, gate 7 fire correctamente pero el state queda inconsistente entre cola y store. El drain shipped respeta este orden.
+
+#### 6.7.4 Diagrama: secuencia de gates
+
+```mermaid
+stateDiagram-v2
+    [*] --> G1: enter
+    G1 --> G2: ok
+    G2 --> G3: ok
+    G3 --> G4: ok
+    G4 --> G7: genesis=true
+    G4 --> G5: genesis=false
+    G5 --> G6a: prev_root found
+    G6a --> G6b: proof valid
+    G6b --> G8: leaves match BSV
+    G7 --> G8: no prior genesis
+    G8 --> G9: BSV ok / idempotent
+    G9 --> [*]: slice canonical
+
+    G1 --> Reject: structural fail (1-4)
+    G2 --> Reject
+    G3 --> Reject
+    G4 --> Reject
+    G5 --> Orphan: ChainOrphanPreviousSlice (\u2192 PendingSlice)
+    G6a --> Reject: ChainProofInvalid
+    G6b --> Reject: ChainProofLeafUnknown
+    G7 --> Reject: ChainDuplicateGenesis (A1 + H3)
+    G8 --> Reject: ChainBlockSliceConflict
+    G9 --> Reject: ChainSliceRootConflict
+```
+
+> **⚠️ Scope shipped v0.4:** este validator corre **solo en el subscribe path** (`ingest_subscribed_slice` en `crates/ckl-aether-client/src/lib.rs:756`). El intent path (`Intent::ImportAetherPackage`, handler `execute_import_aether_package` en `crates/ckl-runtime/src/protocol.rs:2293`) hoy bypassa los 9 gates. Ver **§6.8 (Bifurcación de entry points)** para el estado shipped vs target convergencia y para el cross-ref con T15/T16/T17/T18 del threat model `bf6f5e35-d`.
+
+### 6.8 Bifurcación de entry points (estado v0.4 shipped + target convergencia)
+
+> Sección añadida en revisión pre-D8 (v0.4 → v0.4.1 del threat model). Documenta una bifurcación arquitectural descubierta durante la preparación del mini-funcional E2E: existen **dos entry points para ingerir wire v5** y ejercen superficies de seguridad **disjuntas**. Ningún entry point shipped corre simultáneamente las tres superficies (chain validator + provenance/grafo + allowlist). DEC-4 (§0.0.2) ya cerró la decisión: el intent path debe converger al chain validator. Esta sección formaliza el estado y el contrato target.
+
+#### 6.8.1 Estado shipped (v0.4)
+
+Los dos entry points relevantes:
+
+- **Intent path** — `Intent::ImportAetherPackage`, handler `execute_import_aether_package` en `crates/ckl-runtime/src/protocol.rs:2293`. Delega la verificación a `ckl_aether_client::verify_package` en `crates/ckl-aether-client/src/lib.rs:138-169`.
+- **Subscribe path** — `ingest_subscribed_slice` en `crates/ckl-aether-client/src/lib.rs:756`. Delega la verificación a `verify_slice_chain_v04` (los 9 gates de §6.7).
+
+| Dimensión | Intent path (`Intent::ImportAetherPackage` → `verify_package`) | Subscribe path (`ingest_subscribed_slice` → `verify_slice_chain_v04`) |
+|---|---|---|
+| **Wire version aceptado** | `FORMAT_VERSION=5` (rechaza otros vía `ClientError::UnsupportedFormatVersion`) | `FORMAT_VERSION=5` (mismo gate decode-time) |
+| **Validator usado** | `verify_package`: digest gate + `PublisherCertificate::ensure_publisher_id` + `signed.verify(root_pk, now)` (sig chain + cert window). **NO corre los gates 5-9.** No verifica `previous_slice_root`, no verifica merkle proof, no corre `gate_double_genesis`. | `verify_slice_chain_v04` completo: gates 1-4 (estructurales del manifest), 5 (lookup `previous_slice_root`), 6a/6b (merkle proof + cross-check de hojas contra BSVs), 7 (`gate_double_genesis`), 8 (BSV persist idempotente), 9 (`slice_root` persist idempotente). |
+| **Storage primitives escritas** | `put_block` por bloque + `append_provenance` por bloque + `drain_resolved_edges` post-`put_block` + `put_relationship` por relación materializada + `enqueue_pending_edge` por edge cross-package no resuelta. **NO escribe** `try_put_block_slice_version_idempotent` ni `try_put_slice_root_idempotent`. | `try_put_block_slice_version_idempotent` (gate 8) + `try_put_slice_root_idempotent` (gate 9) + `enqueue_pending_slice` en `ChainOrphanPreviousSlice` + `drain_landed_slice_cascade` post-`Ok`. **NO escribe** `put_block`, `append_provenance`, `put_relationship`, ni `enqueue_pending_edge`. |
+| **Allowlist consultado** | NO — el handler no invoca `is_publisher_visible` ni `RuntimeConfig.publisher_allowlist_mode` (H7-A/B/C de Área C aplican a queries de salida, no a la admisión de bytes). | NO — el chain validator no consulta allowlist; gates 1-9 son cripto-puros + storage primitives sobre BSV/`slice_root`. |
+
+**Lectura cruda — sé honesto sobre la consecuencia:** un subscriber que ingiere vía `Intent::ImportAetherPackage` está hoy expuesto a los ataques que el subscribe path mitiga gate por gate. Concretamente:
+
+- **A1 / T16 (genesis replay) no detectado** — el intent path no corre `gate_double_genesis`. Un atacante con cert legítima puede emitir N génesis con misma `(publisher, source)` y el handler los acepta uno detrás de otro.
+- **`previous_slice_root` forjado / inválido** — el intent path no corre gates 5/6a/6b. Un atacante puede declarar `previous_slice_root` apuntando a `[0u8;32]` o a cualquier root que no exista en el store; el handler no lo verifica.
+- **Merkle proof inválido** — sin gate 6, cualquier `merkle_proof` arbitrario pasa.
+- **T15 (cross-publisher impersonation) parcialmente mitigado** — sí se ejerce `ensure_publisher_id` dentro de `verify_package` a nivel package (gate de cert), pero falta la mitigación a nivel de chain que el subscribe path ofrece.
+
+Ver threat model `bf6f5e35-d` (bump v0.4 → v0.4.1) §4.5 — T15/T16/T17 anotadas con scope `subscribe path`, T18 documenta este bypass como 🔴 deuda crítica.
+
+#### 6.8.2 Target convergencia (D9 provisional, hito pre-D8)
+
+**Contrato post-convergencia (no shipped, sibling session `260514-long-heron`):**
+
+`Intent::ImportAetherPackage` deja de tener su propia ruta de verificación y se convierte en un **wrapper coherente** sobre el chain validator + escritura de grafo:
+
+1. **Verificación cripto + cadena** — el handler invoca `verify_slice_chain_v04(signed_manifest, manifest, package, store, root_pk, now)` ANTES de cualquier escritura. Cualquier `ChainValidationError` surface tal cual al caller del intent — no se traduce a `RuntimeError::Other(format!(...))` con cadena suelta. Las variants recoverable (`ChainOrphanPreviousSlice`) producen enqueue de `PendingSlice` y respuesta `Deferred`, alineadas con el path subscribe.
+2. **Persistencia coherente** — sobre `Ok(outcome)` del validator, el handler ejecuta en transacción única:
+   - **BSV + `slice_root` ya quedaron persistidos** dentro de gates 8-9 del validator. El handler **NO duplica** esa escritura.
+   - `put_block` por bloque del package (mantiene compat Área C — clave compuesta `(publisher_id, block_id)`).
+   - `append_provenance` por bloque importado (mantiene `ProvenanceEntry` de T14 / H2).
+   - `drain_resolved_edges` post-`put_block` (mantiene cola Área C `aether_pending_edges`).
+   - `put_relationship` por relación materializada + `enqueue_pending_edge` por edge cross-package no resuelta.
+   - `drain_landed_slice_cascade` post-everything (resolver BFS de `PendingSlice` para D5).
+3. **Allowlist gate (decisión parqueada)** — la integración explícita de `is_publisher_visible` / `RuntimeConfig.publisher_allowlist_mode` en el handler queda parqueada para el hito de implementación. Default conservador propuesto: enforce allowlist **post-`verify_slice_chain_v04` y pre-`put_block`/`append_provenance`**, para que un publisher denied no contamine ni el grafo ni el provenance log. Decisión binaria (integrar o no) la cierra Sergio durante la implementación.
+
+**Razón conceptual:** *"firma + cadena es la garantía, no el entry point"*. Cualquier byte que pase digest + sig chain + 9 gates es indistinguible del que pasaría vía subscribe; tener dos handlers con superficies de seguridad disjuntas viola single point of trust. La convergencia hace que `Intent::ImportAetherPackage` y `ingest_subscribed_slice` compartan **la misma raíz de admisión** (`verify_slice_chain_v04`) y se diferencien solo en qué surface adicional escriben (el intent path añade provenance/blocks/relationships/pending_edges).
+
+#### 6.8.3 Implicaciones
+
+- **D8 (mini-funcional E2E) NO puede ejecutar pre-convergencia.** El objetivo de D8 es ejercer simultáneamente (chain validator + provenance + allowlist) en un mismo flujo. Hoy ningún entry point shipped lo hace: subscribe path corre validator pero no provenance/grafo; intent path corre provenance/grafo pero no validator. D8 quedaría sin entry point al que apuntar.
+- **Convergencia es prerequisito de D8.** D9 (§9) se materializa ANTES de D8. Sin D9, D8 no se puede cerrar.
+- **Convergencia es prerequisito de Área E (HTTP transport).** El transporte HTTP debe tener un solo entry point al que invocar tras recibir bytes del wire. Si Área E aterriza con la bifurcación viva, replicaría el split en otro layer (request handler que invoca uno u otro según contexto, doble lógica de admisión) — inaceptable.
+- **Ship a producción bloqueado.** v0.4 **no debe shippearse a producción** mientras el intent path siga bypassando el chain validator (alineado con el status 🔴 deuda crítica de T18 en el threat model). Merge a `develop` puede proceder con el bypass siempre que se documente claramente (esta sección + threat model + D9 pendiente en §9).
+
+> **Actualización post-D9 (Ola 2, 2026-05-19):** la convergencia descrita en §6.8.2 es ahora la **realidad shipped** — D9 (`157a3ef`) materializa el contrato. La bifurcación pre-D9 documentada en §6.8.1 queda preservada como historial arquitectural. **El estado vivo del sistema está descrito en §6.9 (Two-layer invariant)**, que captura el invariante que sobrevive a la convergencia: incluso con un único entry point, Aether persiste en dos capas con invariantes independientes. Leer §6.8 como contexto histórico; leer §6.9 para el contrato actual.
+
+### 6.9 Two-layer invariant — el contrato post-D9 shipped (Ola 2)
+
+> Sección añadida en Ola 2 (post-D9 + D8 shipped) para capturar un fact arquitectural **load-bearing** que NI el draft original ni §6.8 documentaban: aunque D9 cierra la bifurcación de entry points (ambos paths comparten `verify_slice_chain_v04` como raíz de admisión), Aether persiste el resultado de cada ingesta en **dos capas con invariantes independientes**. D8 reveló esto al ejercer S4 (allowlist deny) y S6 (cascade resolve post-defer); el handler `execute_import_aether_package` documenta el split en un comment load-bearing que es la fuente canónica de este invariante.
+
+#### 6.9.1 Las dos capas
+
+| Capa | Qué persiste | Quién la garantiza | Persiste cuándo |
+|---|---|---|---|
+| **L1 — Publisher-attested chain bookkeeping** | `BlockSliceVersion` (BSV, §4.2) + `slice_root` (§4.6) | Gates 8 y 9 del chain validator | El validator pasa (9 gates ok). Independiente de allowlist, independiente de Area C writes. |
+| **L2 — Workspace-visible state** | `Block` (`put_block`) + `ProvenanceEntry` (`append_provenance`) + `Relationship` (`put_relationship`) + `PendingEdge` (`enqueue_pending_edge`) | Handler `execute_import_aether_package` post-validator | El validator pasa **Y** el allowlist permite **Y** el handler dispatcha (path normal, no cascade). |
+
+**El invariante load-bearing:** L2 puede estar **vacía** para una identidad de slice `(publisher, source, entity, slice)` mientras L1 **sí tiene entradas** para esa misma identidad. Esto es **estado válido**, no un bug ni un attack.
+
+#### 6.9.2 Evidence-text (handler comment load-bearing)
+
+El comment de `crates/ckl-runtime/src/protocol.rs:2480-2498` es la fuente canónica del invariante. Cita literal:
+
+> ```rust
+> // 5. ALLOWLIST GATE (§10.3 default — post-validator, pre-put_block).
+> //    `is_publisher_visible` honours `publisher_allowlist_mode`
+> //    (Open vs Strict) and the H7-C row; LOCAL is bypassed by R13.
+> //    The validator gates already persisted BSV + slice_root
+> //    (gates 8-9) by the time we get here — those are
+> //    *publisher-attested* bookkeeping, not workspace-visible
+> //    block state. The allowlist guards admission into the local
+> //    graph (put_block / append_provenance / put_relationship),
+> //    which is the operator-facing surface.
+> ```
+
+Lo decisivo de este comment: la palabra "*publisher-attested* bookkeeping" frente a "workspace-visible block state" **nombra explícitamente las dos capas** y justifica por qué el handler no puede colapsarlas en un solo write. Antes del comment, el orden gate-8 → gate-9 (BSV → slice_root) ya **había persistido la cadena**. Lo que viene después (allowlist + put_block + provenance + relationships) es **otra superficie** con otro invariante.
+
+#### 6.9.3 Catálogo de casos — cuándo L2 está vacía mientras L1 tiene entradas
+
+**(a) Allowlist deny post-validator** *(D8 S4 lo pinea como test E2E shipped, `d779840`)*
+
+Un subscriber recibe un paquete v5 vía `Intent::ImportAetherPackage` cuyo publisher **no está allowlisted** bajo `RuntimeConfig.publisher_allowlist_mode` (Strict sin allow-row, u Open con deny-row). Secuencia shipped:
+
+1. `verify_slice_chain_v04` corre los 9 gates → `Ok(outcome)` (chain válido, BSV + slice_root persistidos en gates 8-9).
+2. Handler invoca `is_publisher_visible(package_publisher)` → `false`.
+3. Handler retorna `RuntimeError::Other("aether import: publisher 'X' is not allowlisted ...; BSV + slice_root persisted (publisher-attested), but Area C writes refused")`.
+4. **Estado resultante:** L1 tiene entrada (`BSV[(pub,src,blk,slc)] = ...`, `slice_root[(pub,src,ent,slc)] = ...`). L2 vacía (`block`, `provenance_entry`, `relationship` no tocados).
+
+**(b) Cascade resolve post-defer** *(D8 S6 lo pinea como test E2E shipped, `d779840`)*
+
+Un slice `slc_43` llega antes que su predecesor `slc_42` → `ChainOrphanPreviousSlice` → enqueue en `PendingSlice`. Luego llega `slc_42` y dispara cascade resolver. Secuencia shipped:
+
+1. Llegada de `slc_42` (entry point puede ser intent o subscribe — irrelevante) → `verify_slice_chain_v04` pasa → BSV + slice_root de `slc_42` persistidos.
+2. Si entry point fue intent path, el handler además ejecuta L2 writes para `slc_42` (block + provenance + relationships).
+3. Post-import de `slc_42`, `resolve_pending_descendants_of` (`crates/ckl-aether-client/src/pending_resolver.rs:269`) drena `PendingSlice` candidatos cuya `waiting_on` matchee `SliceRootKey(slc_42)`. Para cada candidato (ej. `slc_43`) llama `verify_slice_chain_v04` **directo** — NO dispatchea `Intent::ImportAetherPackage` al handler.
+4. **Estado resultante para `slc_43`:** L1 tiene entrada (BSV + slice_root de `slc_43` persistidos por gates 8-9). L2 vacía (handler no se invocó → no `put_block`, no `append_provenance`, no `put_relationship`).
+
+**Por qué cross-crate dispatch fue diferido:** `pending_resolver` vive en `ckl-aether-client`; el handler (`execute_import_aether_package`) vive en `ckl-runtime`. Dispatchear el Intent desde `ckl-aether-client` requiere acoplar crates en dirección inversa (client → runtime), lo cual hoy no existe en el grafo de dependencias y rompería la dirección del cono. Diferido a Área E o a un refactor de runtime dedicado.
+
+**(c) Rate-limit per-publisher drop (futuro, parqueado en Q-E para Área E)**
+
+Cuando Área E (T1 Bulk transport) agregue rate-limit per-publisher como pre-filtro al admission path, un slice puede ser rejected ANTES del validator. En ese caso L1 tampoco se toca (no hay write). PERO si el rate-limit se aplica **post-validator y pre-Area-C writes** (defensa en profundidad), entonces L1 ya está poblado y L2 vacía — mismo perfil que caso (a). Decisión final del placement (pre vs post-validator) la cierra Área E. Por ahora se documenta el caso para que el threat model T19 lo cubra.
+
+#### 6.9.4 Implicación operativa — leer L1 vs L2 según query
+
+| Caso de uso | Capa correcta | Tool / API |
+|---|---|---|
+| **Reasoner / agent queries** ("dame el contenido del bloque X en slice Y") | **L2** | `find_blocks_by_source_publisher`, `get_block`, `traverse_relationships` |
+| **Audit / forensics** ("¿qué slices firmó publisher P para source S?") | **L1** | scan de namespace `slice_roots::` + `block_slice_version::` por `(publisher, source)` |
+| **Verificación de cadena** ("¿slc_43 es descendiente Merkle de slc_0?") | **L1** | `verify_slice_chain_v04` puede ejercer gates 5/6 sobre L1 sin requerir L2 |
+| **Reconciliación pending → real** ("¿cuáles cascaded slices no aterrizaron en L2?") | **L1 minus L2** | diff `slice_roots::` (L1 visible) vs `block` (L2 visible) por publisher; gap = subscriber re-pull candidate |
+
+**Regla canónica:** las queries de razonamiento del agente (lo que el usuario percibe como "contenido del workspace") deben pasar por L2. La auditoría criptográfica de "qué se aceptó como firmado" pasa por L1. Confundirlas lleva al operador a interpretar L1 entries sin L2 contents como un attack (no lo es) o, peor, a confiar en L2 para audit (incompleto — L2 no carga el slice_root ni el BSV digest).
+
+#### 6.9.5 Self-healing por subscriber re-pull (Área E, post-D)
+
+La inconsistencia "L1 con entrada, L2 vacía" del caso (b) es **self-healing por construcción** cuando Área E aterrice el subscriber polling pattern:
+
+1. Subscriber detecta gap (slice_root presente, block ausente para el mismo `(pub, src, blk, slc)`).
+2. Subscriber dispara `Intent::ImportAetherPackage` re-importando el paquete desde el mirror (los bytes son los mismos — Aether es público).
+3. Handler ejecuta path normal (validator → allowlist → L2 writes). BSV + slice_root persisten idempotentemente (P2 tri-state, ver §4.2 / §4.6). L2 ahora pobla.
+
+Para el caso (a), la mitigación es **operacional**: el operador modifica la allowlist (mueve el publisher a allow-list) y dispara re-import. Mismo flujo idempotente.
+
+Cross-ref: threat model `bf6f5e35-d` v0.4.2 §4.5 T19 cataloga el cascade gap como amenaza 🟡 (parcial, self-healing) y §10.4 desarrolla las implicaciones de seguridad del two-layer invariant.
+
+---
+
+## 7. Migración del wire (D7)
+
+### 7.1 Estrategia: bump estricto, sin retrocompat
+
+```rust
+pub const FORMAT_VERSION: u32 = 5;
+```
+
+- Parser de paquetes verifica `format_version == 5` antes de hacer nada. Cualquier otro valor → `Err(WireFormatMismatch)`.
+- No hay degradación automática. No hay "lectura legacy".
+- Razón: Aether aún no está en producción. Un bump limpio simplifica todo el código (un solo path).
+
+### 7.2 Implicaciones en el codebase
+
+| Componente | Cambio |
+|---|---|
+| `ckl-aether-format` | `FORMAT_VERSION = 5`; `AetherId` ya existe (`lib.rs:603`) — endurecer validación según matriz §3.3; añadir parser de URI canónica `aether://...`; `EvolvesToEdge`, `RetentionPolicy`, `previous_slice_id`, `previous_slice_root`, `merkle_proof`, `genesis`, `genesis_attestation` al manifest schema |
+| `ckl-aether-sign` | Manifest serialization incluye todos los nuevos campos (D4 + D11) en el digest firmado. Genesis attestation requiere segunda firma sobre `(publisher_id, slice_id, timestamp)`. |
+| `ckl-aether-client` | Importar paquete v5: validar invariantes EVOLVES_TO + insertar en `block_slice_version` + emitir relaciones |
+| `ckl-types::relationship` | Añadir variante `EvolvesTo` + categoría `Temporal` + tests serde + `is_symmetric=false` + categoría `Temporal::is_epistemic=false` |
+| `ckl-types::ids` | **Sin cambio.** `SliceId` ya existe (`ids.rs:98`). D9 lo reusa tal cual. |
+| `ckl-aether-format::aether_id` | Endurecer `validate_segment` → `validate_identifier` para `publisher`, `source`, `slice_id` (alineado con manifest). `block_id` permanece laxo (D9 final, v0.3 §3.3). Añadir parser de URI canónica `aether://...` con `Display` simétrico. |
+| `ckl-store` | Migración schema: nueva tabla `block_slice_version`; índice latest; tabla `pruned_slices` |
+| `ckl-runtime::protocol` | Nuevo `Intent::PruneSliceVersions`; resolver bifurcado (§8) |
+
+### 7.3 Tests de contrato
+
+- `trybuild`: parser de `format_version=4` falla en runtime con error tipado.
+- E2E: paquete v5 con `evolves_to_edges` que violan invariantes → rechazo limpio.
+- E2E: paquete v5 con manifest sin `retention_policy` → rechazo (`KeepAll` no es default implícito; debe estar presente).
+
+---
+
+## 8. Resolver hooks (H4/H5 extendidos)
+
+> **Estado v0.4 shipped (top-level caveat — leer antes que §8.1-8.4):** §8 describe la forma objetivo del resolver, intent layer, retention y visibility a nivel de **slice**. La implementación slice-aware requiere retrofit de `PendingEdge`, `Relationship` y equivalentes con `slice_id` / `slice_endpoints` — **no shipped en `feat/aether-v0.4`**. Lo único shipped es el path Área C heredado: resolución de pending edges por `BlockKey` 2-tuple `(publisher_id, block_id)` vía `drain_resolved_edges` en `ckl-runtime::protocol` post-`put_block`. Las sub-secciones §8.1-§8.4 describen el contrato objetivo (referencia para Área E o v0.4.x patch), no el código actual. Verificación negativa de soporte (round 3): `Relationship` shipped (`ckl-types::relationship.rs:326-356`) NO carga campos de slice; `slice_endpoints()`, `IntentError::SameAsPinnedUnsupported`, `validate_same_as` y un cache layer con keys `live`/`pinned` NO existen en el repo.
+
+### 8.1 H4 — lazy resolution on `put_block`
+
+Hoy (Área C): cuando llega un bloque nuevo, se barren `aether_pending_edges` cuyo `target` coincida con `(target_publisher_id, target_block_id)` y se materializan.
+
+**Cambio en Área D:** dos paths.
+
+```rust
+fn resolve_pending_on_put_block(block: &Block, slice_id: Option<SliceId>) {
+    // Path 1 — live: pending edges con slice_id=None (mayoría de casos)
+    let live_pending = find_pending_edges(block.publisher_id, block.block_id, None);
+    materialize_all(live_pending, target_slice = None);
+
+    // Path 2 — pinned: pending edges con slice_id=Some(this_slice)
+    if let Some(sid) = slice_id {
+        let pinned_pending = find_pending_edges(block.publisher_id, block.block_id, Some(sid));
+        materialize_all(pinned_pending, target_slice = Some(sid));
+    }
+}
+```
+
+> Ver caveat top-level de §8.
+
+### 8.2 H5 — `SameAs` resolution
+
+Hoy (Área C): si llega `A SameAs B` y B no existe localmente, la relación queda `Pending`; al llegar B (vía `put_block`), se materializa.
+
+**Cambio en Área D:** `SameAs` aplica **sólo sobre live refs**. Sobre pinned refs queda indefinido (Open Q1 en §13). Default conservador: el resolver **ignora** afirmaciones `SameAs` cuando alguno de los endpoints carga `slice_id` no-None.
+
+```rust
+fn validate_same_as(rel: &Relationship) -> Result<()> {
+    if rel.slice_endpoints().is_some() {
+        // SameAs sobre pinned refs no soportado en v0.4. Rechazo controlado.
+        return Err(IntentError::SameAsPinnedUnsupported);
+    }
+    Ok(())
+}
+```
+
+### 8.3 Cache
+
+Keys diferenciadas:
+- Live: `cache_key("live", pub_id, blk_id)`.
+- Pinned: `cache_key("pinned", pub_id, blk_id, slice_id)`.
+
+TTL distintos (config):
+- Live: TTL corto (ej. 5 min) — el agente espera frescura.
+- Pinned: TTL largo o infinito — el contenido es inmutable por construcción.
+
+### 8.4 Latencia objetivo
+
+- Live `≤ baseline Área C`.
+- Pinned `≤ baseline + 20ms p95` (overhead aceptable por extra index lookup).
+
+---
+
+## 9. Hitos verificables (D1-D8)
+
+| Hito | SHA propuesto | Descripción | Tests |
+|---|---|---|---|
+| **D1** | `1dbac76` `feat(aether-format): D1 — AetherId parser supports optional slice segment` | Parser 3/4 segmentos, validación asimétrica D9 (`publisher`/`source`/`slice_id` body por `validate_identifier`; `block_id` permanece laxo); `Display` simétrico; 7 nuevas `FormatError` variants + 14 nuevos tests + 7 migrados. **Reusa `SliceId` existente** (D9). | unit + trybuild |
+| **D2** | `a88471a` `feat(store): D2 — block_slice_version schema + AetherStore methods` (+ `ee1485b` P1 retrofit a 4-tuple PK, `d812f62` P2 append-only `try_put_*_idempotent`) | Tabla BSV append-only con PK 4-tuple `(publisher, source, block, slice)` (cross-source isolation, P1); idempotent helpers tri-state `nuevo` / `idempotent-replay` / `conflict` (P2). Ver §4.2. | unit + integration |
+| **D3** | `5261dac` `feat(types): D3 — RelationshipType::EvolvesTo + Temporal category` | Variante #46, nueva categoría #12 `Temporal`, serde con alias `"EvolvesTo"` → `"EVOLVES_TO"`, `is_symmetric=false`, `is_epistemic=false`. 5 tests nuevos + 3 arrays exhaustivos. | unit (serde roundtrip, category exhaustive) |
+| **D4** | Serie shipped: `e09d938` D4-1 (`MerkleRoot`, `AetherMerkleProof`, `RetentionPolicy` types + merkle module) · `29ac4d7` D4-2 (`SliceManifest` v2 + `manifest_version` + hash domain bump — **incluye `FORMAT_VERSION=5` ship, ver D7**) · `5d5ee77` D4-3 (`AetherStore` slice_root methods + Memory/SurrealKv impls) · `ee1485b` P1 retrofit (4-tuple BSV PK) · `d812f62` P2 (strict append-only contract) · `a9cee07` D4-4a (`ChainValidationError` + pure-gates 1-4 skeleton) · `358d407` (cross-publisher impersonation gate — T15 prereq) · `0b8ba1f` D4-4b (async gates 5-9 + `verify_slice_chain_v04` orchestrator) · `1378ef2` (typed `StorageBackendFailure` variant) · `e47ff0b` D4-4c (gate 6b leaf cross-check + cross-backend test matrix) | `retention_policy` + slice chain Merkle (`previous_slice_id`, `previous_slice_root`, `merkle_proof`, `genesis`, `genesis_attestation`) en `SignedManifest` firmado. Validador `verify_slice_chain_v04` con 9 gates documentados en §6.7 (incluye `gate_double_genesis` gate 7 — D11). | unit + E2E |
+| **D5** | `48f2e53` (D5-1 types) + `ba3dc7d` (D5-2 store) + `3415ad3` (D5-3 client codec+hook) + `58806c4` (D5-4 BFS resolver+cap) + `1128602` (D5-5 cross-backend matrix) | **PendingSlice cascade resolver** (no resolver de pending edges — eso queda como Área C heredada, ver caveat top-level §8). Buffer + drain de slices out-of-order cuyo `previous_slice_root` apunta a un predecesor aún no aterrizado; BFS con cap `PENDING_SLICE_CASCADE_HOP_CAP=64`, re-validación on-replay, terminal-counter. Ver §5.6 y §6.7. | unit + integration + cross-backend matrix |
+| **D9** | `157a3ef` `feat(runtime): D9 — delegate intent path to chain validator` · owner sibling session `260514-long-heron` · status **shipped** | **Unify v0.4 entry points** (DEC-4, §6.8 → realidad post-D9 en §6.9): `Intent::ImportAetherPackage` delega a `verify_slice_chain_v04` ANTES de cualquier escritura; gates 8-9 persisten BSV + `slice_root` (L1 — publisher-attested); handler escribe `put_block` + `append_provenance` + `drain_resolved_edges` + `put_relationship` + `enqueue_pending_edge` + `drain_landed_slice_cascade` post-validator + allowlist gate intercalado (L2 — workspace-visible). Cierra T18 del threat model `bf6f5e35-d` (🔴 → 🟢). **Two-layer invariant** queda formalizado en §6.9 como fact arquitectural que sobrevive a la convergencia (L2 puede estar vacía mientras L1 persiste — caso (a) allowlist deny, caso (b) cascade resolve). | E2E (D8) + threat model T15/T16/T18 promoted a `ambos paths` en v0.4.2 |
+| **D6** | **NOT SHIPPED en v0.4** — depende de Q-B (§0.0.2 / §13). Stub `Intent::PruneSliceVersions` reservado en backlog v0.4.x. | Allowlist enforce + error si `KeepAll`. Diferido a post-MVP por decisión Q-B parqueada. | n/a en v0.4 |
+| **D7** | Materializado dentro de D4-2 (`29ac4d7` `feat(format): D4-2 — SliceManifest v2 fields + manifest_version + hash domain bump`) | `FORMAT_VERSION: u32 = 5` strict + `MANIFEST_HASH_DOMAIN` bumped + `MIN_SUPPORTED_FORMAT_VERSION = 5` + decode-time `UnsupportedVersion` reject (DEC-3, §0.0.2). NO row independiente — el bump es indistinguible del resto de D4 a nivel git. | unit + trybuild |
+| **D8** | `d779840` `test(runtime): D8 — mini-funcional E2E (7 scenarios) closes Área D` | Mini-funcional E2E con 7 escenarios sobre `Intent::ImportAetherPackage` unificado post-D9 — chain validator + provenance + allowlist + cascade resolver ejercidos desde único entry point. **S4 pinea Two-layer caso (a)** (allowlist deny post-validator: L1 persiste, L2 vacía). **S6 pinea Two-layer caso (b)** (cascade resolve post-defer: `resolve_pending_descendants_of` llama `verify_slice_chain_v04` directo sin dispatchear Intent, L1 persiste, L2 vacía). Cierra Área D. | E2E |
+
+**Criterio de cierre Área D:** ✅ **CLOSED 2026-05-19 (Ola 2 polish).** PR `feat/aether-v0.4` con D1-D5 + D8 + D9 verdes; D6 parqueado como Q-B (post-MVP); D7 materializado dentro de D4-2. Threat model `bf6f5e35-d` actualizado v0.4 → v0.4.1 (T18 introducido) → v0.4.2 (T18 covered + T19 nuevo + §10.4 two-layer). Spec en estado `published` con Two-layer invariant capturado como fact arquitectural load-bearing (§6.9).
+
+---
+
+## 10. Tests E2E mínimos
+
+| # | Caso | Set-up | Assert |
+|---|---|---|---|
+| **10.1** | "Cita viva sobrevive evolución" | KOSLAB publica `blk_pk` en slc_42 → subscriber importa → publica slc_43 → subscriber importa | `resolve(aether://koslab/ckl-spec/blk_pk)` retorna contenido de slc_43 |
+| **10.2** | "Cita pinned permanece estable" | Idem 10.1 | `resolve(aether://koslab/ckl-spec/slc_42/blk_pk)` retorna contenido **original** de slc_42, no slc_43 |
+| **10.3** | "EVOLVES_TO chain reconstruible" | Cadena slc_40→41→42→43 | `traverse(EvolvesTo, from=slc_40/blk_pk)` retorna 3 edges y termina en slc_43 |
+| **10.4** | "Pinned ref a slice prunado → Tombstone" | Publisher con policy `Window{2}` (test usa la variante reservada) prunea slc_40 | `resolve(slc_40/blk_pk)` retorna `Tombstone(slc_40)`, no error |
+| **10.5** | "Wire v4 rechazado" | Cliente v5 recibe paquete con `format_version=4` | `Err(WireFormatMismatch{found:4, expected:5})` |
+| **10.6** | "EVOLVES_TO con invariante violada" | Paquete con `EvolvesTo(blk_A@slc_42 → blk_B@slc_43)` (block_id distinto) | `Err(WireInvariantViolation::EvolvesToShape)` |
+| **10.7** | "SameAs sobre pinned rechazado" | `SameAs(slc_42/blk_A, slc_42/blk_B)` | `Err(IntentError::SameAsPinnedUnsupported)` |
+| **10.8** | "Importar paquete sin retention_policy" | Manifest v5 sin campo | `Err(WireSchemaInvalid("retention_policy missing"))` |
+| **10.9** | "Manifest tampered: retention_policy strippeada post-firma" | Tomar manifest firmado con `KeepAll`, eliminar el campo, re-serializar manteniendo la firma original | `Err(SignatureMismatch)` al re-verificar. Garantiza que el campo participa en el digest firmado (D4). |
+| **10.10** | "Slice chain roto detectado" | Importar `slc_43` con `previous_slice_id=slc_42` pero `previous_slice_root` apuntando a un root incorrecto | `Err(SliceChainBroken { expected_prev_root, got_prev_root })` (D11) |
+| **10.11** | "Doble genesis rechazado" | Importar un primer manifest con `genesis=true` (acepta), luego un segundo con `genesis=true` para el mismo `publisher_id` | `Err(DuplicateGenesis { publisher_id })` (D11) |
+
+---
+
+## §11 — Threat model
+
+Las amenazas de Área D / D5 / D8 / D9 están consolidadas en el threat model `bf6f5e35-d` **v0.4.2** (§4.5 T15-T19 — incluyendo T18 ahora 🟢 covered post-D9 y T19 nuevo 🟡 cascade resolve gap + §10.1-10.4 mitigaciones arquitecturales con §10.4 dedicado a **Two-layer invariant security implications**). Esta sección se mantiene como pointer para preservar el anchor; ver doc dedicado para contenido vivo. Cross-ref específico: §6.9 (Two-layer invariant, este doc) ↔ `bf6f5e35-d` §4.5 T19 + §10.4.
+
+---
+
+## 12. No-objetivos (explícitos)
+
+- ❌ Forks / branching de un mismo `BlockId` en historias divergentes. Quien quiera divergir, crea un `BlockId` nuevo y emite `Supersedes`.
+- ❌ Mantener compatibilidad con clientes v4. Bump estricto.
+- ❌ Implementar `Window{N}` y `Cadence{every}` retention en runtime. Sólo se reservan en el enum.
+- ❌ Política de retención compartida cross-publisher. Cada publisher declara la suya.
+- ❌ Selective disclosure de slices privados (P3, post-G).
+- ❌ Optimización del `block_slice_version` (sharding, particionado por publisher). Post-MVP.
+
+---
+
+## 13. Open questions
+
+| # | Pregunta | Decisión pendiente | Bloquea | Notas |
+|---|---|---|---|---|
+| **Q1** | ¿`SameAs` se hereda a versiones pinned? | Default v0.4: NO (rechazo controlado, §8.2). Discusión post-D. | nada | Conservador. |
+| **Q2** | ¿`Tombstone` es bloque firmado vacío o sólo señal del resolver? | Default v0.4: señal del resolver (tabla `pruned_slices` local). | retention Window/Cadence | Más simple. |
+| **Q5** | Política para "aligerar" retención sin perder garantías pinned. | Diferida a post-MVP. | nada | Evaluar con datos de footprint real. |
+| **Q-A** | ¿Genesis attestation = segunda firma sobre `(publisher_id, slice_id, timestamp)` o basta con flag `genesis: true` en el `SignedManifest` ya firmado? | Pendiente Sergio + Alex (threat model `bf6f5e35-d` v0.4). | **D4** (RetentionPolicy + manifest shape) | Doble firma sube garantías anti-doble-genesis pero añade key management. Resolver antes de cerrar D4. |
+| **Q-B** | `Intent::PruneSliceVersions`: ¿stub `Unimplemented` para reservar shape en v5 o diferir completo a post-MVP? | Pendiente Sergio. | **D4** (forma del enum `Intent` en v5) | Stub preserva opción futura sin requerir bump posterior. Diferir mantiene v5 mínimo. |
+| **Q-E** | Rate-limit per publisher en T1 Bulk. | Diferido a Área E (transporte). | nada | Fuera de scope Área D. |
+
+> Q3 → **D9** · Q4 → **D10** · Q6 → **D11** · Q-C → **DEC-1** (Merkle topological ordering, v0.4) · Q-D → **DEC-2** (v5 bump justification, v0.4). Numeración Q1/Q2/Q5 preservada para no romper referencias externas (Alex, threat model); Q-A/Q-B/Q-E nuevas en v0.4.
+
+---
+
+## 13.x Backlog v0.4.x (follow-ups documentales — Ola 2)
+
+Items registrados durante el cierre de Área D / Ola 2 polish. No bloquean el cierre; son drivers naturales para v0.4.x patches o para Área E.
+
+| # | Item | Driver natural | Notas |
+|---|---|---|---|
+| **BL-1** | **Cascade resolver dispatches `Intent::ImportAetherPackage` via handler** (en lugar de llamar `verify_slice_chain_v04` directo desde `crates/ckl-aether-client/src/pending_resolver.rs:269`) — eliminaría el caso (b) del Two-layer invariant (§6.9.3). | **Área E** vía subscriber re-pull pattern (probable cierre sin código nuevo en `pending_resolver`: cuando el subscriber detecte gap L1-without-L2 vía polling, re-dispara intent path normal e idempotencia de gates 8-9 hace el resto). | Cross-crate dispatch directo (`ckl-aether-client` → `ckl-runtime`) rompe dirección del cono de dependencias; diferido hasta que Área E force la decisión. Documentado en §6.9.3 (b). |
+| **BL-2** | **Per-source `PendingSlice` eviction primitive** (`evict_lru_pending_slices_for_source`) — aislar publishers maliciosos vs legítimos en la cola `PendingSlice`. Hoy v0.4 sólo expone `evict_lru_pending_slices(max_entries)` global. | **Área E** cuando T1 Bulk rate-limit requiera quotas per-publisher. | Ya estaba en backlog v0.4 desde D5 ship. Mantener. Threat model T17 referenced. |
+| **BL-3** | **Q-E — Rate-limit per-publisher en T1 Bulk** — placement decision (pre-validator vs post-validator) y mecanismo (token bucket per-`PublisherId` vs cap global). | **Área E** (transporte HTTP). | Si se aplica post-validator, abre caso (c) del Two-layer invariant (§6.9.3) y threat model T19 (§4.5). Decisión final del placement la cierra Área E. |
+| **BL-4** | **Promover `slice_id` a columna en `relationships`** si más variantes de `Temporal` aparecen post-D. Hoy `EvolvesTo` es la única (§6.4) y el `slice_id` viaja en `metadata` JSON. | Área futura — `SupersedesSlice`, `RolledBackTo`, etc. | Decisión data-driven: cuando 2+ variantes temporales aparezcan, schema migration paga la pena. |
+| **BL-5** | **Q-A — Genesis attestation final shape** (segunda firma sobre `(publisher_id, slice_id, timestamp)` vs flag `genesis: true` en `SignedManifest` ya firmado). Pendiente Sergio + Alex. | Pre-D6 (si D6 se desbloquea) o Área futura de hardening de cripto. | Threat model `bf6f5e35-d` referenced. |
+| **BL-6** | **D6 — `Intent::PruneSliceVersions` + `pruned_slices` table + `Tombstone` resolver response** (Q-B). | Post-MVP, cuando footprint real justifique GC operacional. | Hoy default `KeepAll` lo hace innecesario. |
+
+Items BL-1, BL-2, BL-3 son los críticos para Área E. BL-4/5/6 son post-MVP.
+
+---
+
+## 14. Estrategia de PR
+
+**Decisión confirmada (D8):** PR único `feat/aether-v0.4` que materializa D1-D8 juntos.
+
+**Razón:**
+- D1 (parser) sin D2 (storage) deja al runtime en estado incoherente — puede parsear pinned refs pero no resolverlas.
+- D3 (EVOLVES_TO) sin D4 (retention) deja al manifest schema incompleto vs v5.
+- Bump v5 estricto (D7) sólo tiene sentido cuando todo lo demás está adentro.
+
+**Estructura sugerida del PR:**
+
+```
+feat/aether-v0.4
+├── crate: ckl-types
+│   └── relationship.rs           (D3 + D10 — variante EvolvesTo + categoría Temporal + tests)
+├── crate: ckl-aether-format
+│   ├── aether_id.rs              (D1 + D9 — parser 3/4 segs + validación estricta SliceId/BlockId)
+│   └── manifest.rs               (D4 + D7 — RetentionPolicy, FORMAT_VERSION=5)
+├── crate: ckl-aether-sign
+│   └── digest.rs                 (D4 — incluir retention_policy en digest)
+├── crate: ckl-store
+│   ├── schema.rs                 (D2 — block_slice_version, pruned_slices)
+│   └── memory.rs / surrealkv.rs  (D2 — Storage trait extension)
+├── crate: ckl-runtime
+│   ├── protocol/intent.rs        (D6 — PruneSliceVersions)
+│   └── resolver.rs               (D5 — H4/H5 bifurcado)
+├── crate: ckl-aether-client
+│   └── importer.rs               (D5 — flujo de import con block_slice_version)
+└── tests
+    └── e2e/area_d/*              (D8 — 10.1 a 10.8 de §10)
+```
+
+**Estimación tamaño:** ~2-3k LOC nuevas, ~500 LOC de tests, ~10 archivos modificados.
+
+**Criterio merge:**
+- 100% tests verdes (incluyendo trybuild).
+- Threat model v0.4 (PR separado) referenced en PR description.
+- Spec v0.1 → v0.2 con feedback Sergio + Alex.
+- Sin regresiones en suite Área C (731 tests baseline).
+
+---
+
+## Apéndice A — Glosario delta
+
+| Término | Definición | Tipo / archivo en CKL |
+|---|---|---|
+| **`AetherId` pinned** | URI con 4 segmentos: `aether://pub/source/slice/blk` | §3 |
+| **`AetherId` live** | URI con 3 segmentos: `aether://pub/source/blk` | §3 |
+| **`SliceId`** | Identificador opaco de slice, prefix `slc_`. Reusado de `ckl-types::ids:98`. Wire valida body con `validate_identifier` (`^[a-z0-9_-]{1,64}$`). | D1 + D9 |
+| **`previous_slice_id` / `previous_slice_root`** | Campos en `SignedManifest` que linkean al slice anterior y su Merkle root. `None` sólo en genesis. | D11 |
+| **`merkle_proof`** | Path Merkle desde el nuevo manifest digest hasta `previous_slice_root`. Permite verificar continuidad sin chain completo. | D11 |
+| **Genesis attestation** | Segunda firma sobre `(publisher_id, slice_id, timestamp)` requerida cuando `genesis=true`. Previene doble genesis. | D11 |
+| **`block_slice_version`** | Tabla append-only de versiones de bloque por slice | D2 |
+| **`EvolvesTo`** | Variante #46 de `RelationshipType`, categoría `Temporal` | D3 |
+| **`Temporal`** | Categoría #12 de `RelationshipCategory`, asimétrica, ontológica | D3 |
+| **`RetentionPolicy`** | Enum con variantes `KeepAll` (default v0.4), `Window{N}` (reserved), `Cadence{every}` (reserved) | D4 |
+| **`pruned_slices`** | Tabla local de slices retirados por GC; alimenta `Tombstone` | D6 |
+| **`Tombstone(slice_id)`** | Respuesta del resolver cuando una pinned ref apunta a un slice prunado | §5.5 |
+| **Live ref / Pinned ref** | Ver §1.3 | §1.3 |
+
+---
+
+*v0.4 — DEC-1 (Q-C cerrado): orden topológico-Merkle como criterio de "posterior en chain" en §4.3 y §6.2; `published_at` queda como metadato informativo. DEC-2 (Q-D cerrado): bump v5 justificado por `RetentionPolicy` + `EVOLVES_TO` + delta Merkle en `SignedManifest`, no por shape URI; CBOR de `AetherId` permanece estable. D1 shipped (`1dbac76`), D2 (`a88471a` + retrofit `ee1485b` P1 + `d812f62` P2), D3 (`5261dac`), D4 (serie `e09d938`...`e47ff0b`), D5 (`48f2e53`...`1128602`), D7 materializado dentro de D4-2 (`29ac4d7`), D8 (`d779840`), **D9 shipped (`157a3ef`)** cierra T18 del threat model (🔴 → 🟢) y formaliza el **Two-layer invariant** en §6.9. D6 (`Intent::PruneSliceVersions`) parqueado como BL-6 / Q-B post-MVP. Open questions Q-A (genesis attestation), Q-E (rate-limit T1) parqueadas en backlog. Threat model `bf6f5e35-d` bumped v0.4.1 → v0.4.2 con T19 (cascade resolve workspace-visibility gap, 🟡) + §10.4 Two-layer security implications. **Cierre de Área D ✅ 2026-05-19** — Ola 2 polish lleva spec a published. Desbloquea D9-b + republish CI trilogía v4 + arranque Área E.*

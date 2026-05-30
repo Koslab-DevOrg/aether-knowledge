@@ -1,0 +1,746 @@
+# Aether v0.4 — Área E: T1 Bulk Transport
+
+**Documento de la serie Aether** · v0.2 · published · Mayo 2026
+
+> Spec dedicada de **Área E** — el primer transporte real de Aether: HTTP estático + CBOR firmado + CI publish + CLI subscribe/sync. Es el gate de **"funcional real"** — el primer momento en que dos máquinas reales intercambian conocimiento Aether sin intermediario humano.
+
+**Pre-requisitos:** Áreas A/B/C/D shipped y mergeadas. Lee:
+- [Concepto y Principios v0.2](aether://koslab/specs/concepto) — especialmente §10 (T1/T2/T3) y §16 (roadmap)
+- [Arquitectura v0 Camino C](aether://koslab/specs/arquitectura) — especialmente §4 (formato), §5 (cliente)
+- [Pipeline KOSLAB Dogfooding](aether://koslab/specs/pipeline) — operación completa
+- [Área D — Per-Slice Identity](aether://koslab/specs/area-d) — especialmente §6.9 (Two-layer invariant), §6.7 (validator 9-gates), DEC-4
+
+---
+
+## 0. Changelog
+
+- **v0.2 (2026-05-19 21:25 CST) — PUBLISHED.** Sergio aprobó spec end-to-end. Flip `review → published`. 17 sub-decisiones totales lockeadas (E-D1 a E-D5 + 12 de detalle). Cero `[TODO]` restantes. Desbloquea brief al implementation agent para hito E1 en branch `feat/aether-v0.5`.
+- **v0.1.3 (2026-05-19 PM)** — Batch (5) cerrado: §10 threat catalog completo (T20-T29, +T27 trust file race, +T29 subscriber tracking privacy). 7 sub-decisiones lockeadas: D-§10-1 HTTPS-only hard (plain HTTP via FileBackend), D-§10-2 single URL MVP (multi-mirror a Área G), D-§10-3 reproducible builds aspirational BL-7, D-§10-4 GitHub Secret MVP + KMS v0.5 BL-8, D-§10-5 rollback hard fail `SyncError::RollbackDetected`, D-§10-6 transport caps (30s/10MB/1MB/5MB), D-§10-7 catalog ampliado. Spec listo para `draft → review`.
+- **v0.1.2 (2026-05-19 PM)** — Batch (2)+(3)+(4) cerrado. §5.4 `SignError::UnknownRootAnchor` variant nueva. §7.4 Pass B always-on. §9.1 nuevo crate `ckl-aether-transport` + `ureq`. §9.2 un repo `aether-publications/`. §9.3 `workflow_dispatch` manual para MVP.
+- **v0.1.1 (2026-05-19 PM)** — §4 schemas cerrados (§4.2 manifest.json, §4.3 chain.json, §4.4 slice CBOR, §4.5 blobs/CAS reservado, §4.6 URLs). 5 sub-decisiones lockeadas: D-§4.2-1 publisher key firma manifest, D-§4.2-2 TTL soft warn, D-§4.3-1 chain.json firmado independiente, D-§4.4-1 blobs inline MVP (defer dedup a BL-10), D-§4.5-1 SHA-1 mantenido para `blob_oid`. Convención filename: `slc_<sliceId>.cbor` (sin doble prefijo).
+- **v0.1 (2026-05-19)** — Skeleton inicial. 5 decisiones cerradas (E-D1 a E-D5). Hitos E1-E6 propuestos. Secciones de detalle marcadas con `[TODO]` para iteración subsecuente.
+
+---
+
+## 0.0 Decisiones cerradas (entry point)
+
+| ID | Decisión | Resolución | Sección |
+|---|---|---|---|
+| **E-D1** | Layout en disco post-D | **Indexado por entity** (`pkg/manifest.json + entities/<eid>/{chain.json, slices/, slice_roots/} + blobs/<oid>`) | §4 |
+| **E-D2** | Trust anchor distribution | **Config file** `~/.kos/aether/trust.toml` con KOSLAB root pubkey embedded en releases de `ckl` (editable post-install) | §5 |
+| **E-D3** | Allowlist mode default en subscriber | **Strict + auto-add del publisher del URL** (`ckl aether subscribe <url>` añade publisher implícitamente; cross-publisher rels llegan como Pending hasta que segundo publisher añadido) | §6 |
+| **E-D4** | Rate-limit per-publisher | **Defer a Área F** (T2 Query). En T1 Bulk subscriber controla cadencia (pull-based) → no hay surface DoS real. Caps PendingSlice shipped en D son safety net suficiente. | §8 |
+| **E-D5** | Cascade resolver workspace-visibility (T19) | **Sync re-pull pass** — `ckl aether sync` añade pass extra "scan slice_roots sin block local → re-import via `Intent::ImportAetherPackage`". Self-healing en ciclo natural. Cierra BL-1 + T19. | §7 |
+
+> Todas las decisiones lockeadas por Sergio 2026-05-19 14:43 CST tras presentación de alternativas + recomendaciones.
+
+---
+
+## 1. Qué es Área E
+
+Aether v0.4 Área E es el **primer transporte real T1 (Bulk)** del sistema. Toma todo el foundation criptográfico de Áreas A-D (paquetes firmados, slice chain validator, two-layer invariant, per-slice identity) y le da **dos máquinas que se hablan vía HTTP**.
+
+**Lo que cierra Área E:**
+- Publisher KOSLAB puede tomar un workspace local con knowledge curado, firmarlo, y dejarlo en GitHub Pages.
+- Cualquier máquina con `ckl` puede ejecutar `ckl aether subscribe <url>` + `ckl aether sync` y obtener el knowledge verificado en su workspace local.
+- El primer dogfooding real: `ckl-internals` publicado por KOSLAB, consumido por la segunda máquina KOSLAB.
+- La trilogía conceptual (`1177a168-7`, `898db881-a`, `4c6d9828-7`) republicada como v4 (FORMAT_VERSION post-D bump) vía el CI workflow.
+
+**Lo que NO cierra Área E (queda para F/G/H/I):**
+- T2 Query on-demand vía gRPC + merkle proofs (Área F).
+- T3 Discovery dinámico (Área G).
+- Federación semántica cross-publisher (Área H).
+- Convergencia SAME_AS n-way (Área I).
+- Push-based updates (webhook, server-sent events) — MVP es pull-based puro.
+- Rate-limit per-publisher (defer a F, E-D4).
+- Selective disclosure / privacy granular (post-G).
+
+---
+
+## 2. Estado de entrada — qué traemos de A-D
+
+### 2.1 Shipped y reusable
+
+| Componente | Crate | Rol en E |
+|---|---|---|
+| `ckl-aether-sign` (cert chain, Ed25519 verify, `PublisherCertificate::ensure_publisher_id`) | `ckl-aether-sign` | Verify pipeline (subscriber side) + sign (publisher side) |
+| `ckl-aether-format` (CBOR envelope `AetherPackage` v5, `SliceManifest` v2, hash domains versioned) | `ckl-aether-format` | Wire format on-disk + over-HTTP |
+| `verify_package`, `verify_slice_chain_v04` (9 gates), `ingest_subscribed_slice`, `IngestOutcome`, cascade resolver | `ckl-aether-client` | Subscriber ingest pipeline |
+| `Intent::ImportAetherPackage` (delega al validator post-D9) | `ckl-runtime` | Workspace-visible projection (L2) |
+| `AetherStore` trait (BSV 4-tuple, slice_root 4-tuple, PendingEdge, PendingSlice, allowlist) | `ckl-types` + Memory + SurrealKV | Persistencia idempotente |
+| `Source.entity_id` + `SourceKind::Aether` + auto-bind | `ckl-types` + `ckl-runtime` | Subscribe = `Intent::UpsertSource { kind: Aether }` |
+| `PublisherAllowlistEntry` + `RuntimeConfig.publisher_allowlist_mode` + `is_publisher_visible` query gate | `ckl-runtime` + `ckl-types` | Visibility post-import |
+| Two-layer invariant (L1 publisher-attested + L2 workspace-visible) | spec §6.9 | Contrato semántico |
+
+### 2.2 Lo que falta crear
+
+| Componente | Nuevo crate / archivo | Hito |
+|---|---|---|
+| Layout writer post-D (publisher → disco/Pages) | `ckl-aether-format::layout` (módulo) | E2 |
+| HTTP fetch layer (subscriber → publisher) | `ckl-aether-transport` (nuevo crate) **— ver §9 alt** | E3 |
+| CLI `ckl aether publish` | `ckl-cli` | E4 |
+| CLI `ckl aether subscribe <url>` | `ckl-cli` | E4 |
+| CLI `ckl aether sync` (incluye cascade re-pull pass de E-D5) | `ckl-cli` | E4 |
+| CLI `ckl aether trust add/list/update/revoke` | `ckl-cli` | E4 |
+| Trust anchor config loader | `ckl-aether-sign::trust` (módulo) | E4 |
+| `RelationshipType::PublishedToAether` (variante #48 explícita) | `ckl-types` | E4 |
+| GitHub Actions workflow `.github/workflows/publish.yml` | `ckl` repo | E5 |
+| Repo `Koslab-DevOrg/aether-publications` con README + estructura inicial | nuevo repo | E5 |
+| Workspace publisher `koslab-publications` (local) | operacional | E5 |
+| KOSLAB root key + publisher key (YubiKey + GitHub secret) | operacional | E5 |
+| Cross-machine E2E test (Sergio publica, Alex consume) | manual + reporte | E6 |
+
+---
+
+## 3. Mapa de hitos E1-E6
+
+```mermaid
+graph LR
+    E1[E1 · Layout spec<br/>post-D rediseño] --> E2[E2 · Layout writer<br/>publisher side]
+    E2 --> E3[E3 · HTTP fetch<br/>subscriber side]
+    E3 --> E4[E4 · CLI commands<br/>publish/subscribe/sync/trust]
+    E4 --> E5[E5 · CI workflow<br/>first dogfooding publish]
+    E5 --> E6[E6 · Cross-machine E2E<br/>Sergio publica → Alex consume]
+
+    style E1 fill:#1a1a2e,stroke:#D4AF37,color:#fff
+    style E2 fill:#0f3460,stroke:#7a9cc6,color:#fff
+    style E3 fill:#0f3460,stroke:#7a9cc6,color:#fff
+    style E4 fill:#0f3460,stroke:#7a9cc6,color:#fff
+    style E5 fill:#0f3460,stroke:#7a9cc6,color:#fff
+    style E6 fill:#16213e,stroke:#5fb3a1,color:#fff
+```
+
+| Hito | Goal | Deliverable | Bloquea |
+|---|---|---|---|
+| **E1** | Spec del layout en disco post-D (chain.json, slice_roots/, blobs CAS global) | Sección §4 detallada con schemas + ejemplos | E2 |
+| **E2** | Layout writer (publisher side) — toma `AetherStore` + emite el árbol de archivos | `ckl-aether-format::layout` + tests round-trip | E3, E5 |
+| **E3** | HTTP fetch layer (subscriber side) — pull incremental + cursor + cache | `ckl-aether-transport` crate + tests against local fixtures | E4 |
+| **E4** | CLI: `publish`, `subscribe`, `sync` (con cascade re-pull pass), `trust add/list/update/revoke` | comandos en `ckl-cli` + integration tests | E5 |
+| **E5** | GitHub Actions `publish.yml` + repo `aether-publications` + first dogfooding (`ckl-internals` published) | repo público + 1 slice firmado visible en Pages | E6 |
+| **E6** | Cross-machine E2E: Sergio publica desde laptop, Alex pulls desde la suya, queries `ckl ask` responden mezclando local + Aether | reporte + métricas de éxito según Pipeline doc §8 | **🎯 funcional real** |
+
+**Criterio de cierre de Área E:** los 5 criterios de éxito del MVP en Concepto §8 deben ser verdaderos:
+1. ✅ KOSLAB publica primer paquete curado.
+2. ✅ CKL local resuelve `aether://...` desde cliente fresco vía pull-on-demand y cache, <500ms p95.
+3. ✅ Grafo local cita átomos Aether con misma sintaxis que átomos locales.
+4. ✅ Cada átomo lleva `Provenance` completo verificable contra firma.
+5. ✅ Inmutabilidad sobrevive primer ciclo de actualización (slice viejo intacto y citable cuando sale el nuevo).
+
+---
+
+## 4. Layout en disco post-Área D `[E-D1: indexado por entity]`
+
+### 4.1 Estructura propuesta
+
+```
+<package-root>/                              ← ej: koslab-devorg.github.io/aether-publications/ckl-internals/
+├── pkg/
+│   ├── manifest.json                        ← root manifest firmado: publisher_cert ref, lista entities, head slice_root por entity
+│   └── publisher_cert.cbor                  ← PublisherCertificate firmado por root (referenciado por manifest)
+├── entities/
+│   ├── <entityId-1>/
+│   │   ├── chain.json                       ← cursor firmado: [(slice_id, slice_root, prev, ts)] ordenado topológicamente
+│   │   ├── slices/
+│   │   │   ├── slc_<sliceId>.cbor           ← SignedPackage v5 (un slice = un archivo, blobs inline para MVP)
+│   │   │   └── ...
+│   │   └── slice_roots/
+│   │       ├── slc_<sliceId>.bin            ← 32 bytes literal (verificación independiente del slice_root)
+│   │       └── ...
+│   ├── <entityId-2>/
+│   │   └── ...
+│   └── ...
+└── blobs/                                   ← CAS global (reservado, vacío en MVP — blobs viven inline en slice_<sid>.cbor)
+    └── (vacío en v0.4; futuro: dedup cross-slice, ver §4.4)
+```
+
+> **Diseño clave:** un `subscribe` por entity (no por package). Subscriber elige qué entities consumir. Manifest raíz es ligero (lista entities + cert + head pointers); el peso real está en `entities/<eid>/slices/`.
+
+> **Convención de nombres:** sliceId usa prefijo `slc_` (consistente con `prj_`, `src_`, `doc_`, `blk_`, `psl_` shipped en CKL). Filenames NO duplican el prefijo — `slices/slc_4a3f2c1b.cbor`, NO `slices/slice_slc_4a3f2c1b.cbor`.
+
+### 4.2 `pkg/manifest.json` schema
+
+```json
+{
+  "schema_version": 1,
+  "publisher_id": "koslab",
+  "publisher_cert_ref": "publisher_cert.cbor",
+  "publisher_cert_fingerprint": "sha256:abc123...",
+  "entities": [
+    {
+      "entity_id": "ent_ckl_internals_v1",
+      "chain_ref": "entities/ent_ckl_internals_v1/chain.json",
+      "head_slice_id": "slc_4a3f2c1b9d8e",
+      "head_slice_root_hex": "deadbeef...",
+      "slice_count": 42,
+      "first_published_at": "2026-05-19T15:00:00Z",
+      "last_published_at": "2026-05-19T18:30:00Z"
+    }
+  ],
+  "signed_at": "2026-05-19T18:35:00Z",
+  "ttl_seconds": 86400,
+  "manifest_signature_hex": "..."
+}
+```
+
+**Campos:**
+
+| Campo | Tipo | Rol |
+|---|---|---|
+| `schema_version` | int | Layout JSON shape version. Bump al cambiar shape on-disk (decoupled del `FORMAT_VERSION` CBOR). v0.4 ships `1`. |
+| `publisher_id` | string | Publisher canonical id (matchea `cert.publisher_id`). |
+| `publisher_cert_ref` | string | Path relativo al cert CBOR dentro de `pkg/`. |
+| `publisher_cert_fingerprint` | string | `sha256:<hex>` del cert serializado. Pre-check barato antes de parsear CBOR. |
+| `entities[].entity_id` | string | Canonical entity id (Aether-bound). |
+| `entities[].chain_ref` | string | Path relativo al chain.json de esa entity. |
+| `entities[].head_slice_id` | string | Sliceid del tip de la chain (último publicado). |
+| `entities[].head_slice_root_hex` | hex | Slice root del head. **Optimización crítica:** subscriber decide "¿necesito re-pull?" con UNA comparación, sin fetch de chain.json. |
+| `entities[].slice_count` | int | Total de slices en la chain (incl. genesis). |
+| `entities[].first_published_at` / `last_published_at` | ISO8601 | Display only — no participan en validación. |
+| `signed_at` | ISO8601 | Wall-clock de la firma. Anti-replay: subscriber rechaza si `signed_at` regresa vs último visto. |
+| `ttl_seconds` | int | Cadencia esperada de re-publish. Subscriber emite **warning** (no fail) si manifest stale > TTL. Soft semantics (D-§4.2-2). |
+| `manifest_signature_hex` | hex | **Ed25519 con publisher key** (D-§4.2-1) sobre canonical JSON del manifest excluyendo el campo `manifest_signature_hex`. Reusa la misma key del SignedPackage. |
+
+**Decisiones registradas:**
+- **D-§4.2-1 = (b)** Firma con publisher key (consistente con SignedPackage/SignedManifest), no root key. Root key se queda offline en YubiKey solo para emitir certs.
+- **D-§4.2-2 = (b)** TTL soft warn — subscriber puede estar offline legítimamente (vacation, network); hard fail rompería sync after pause.
+
+### 4.3 `entities/<eid>/chain.json` schema
+
+```json
+{
+  "schema_version": 1,
+  "publisher_id": "koslab",
+  "entity_id": "ent_ckl_internals_v1",
+  "head_slice_id": "slc_4a3f2c1b9d8e",
+  "head_slice_root_hex": "deadbeef...",
+  "chain": [
+    {
+      "slice_id": "slc_genesis001",
+      "slice_root_hex": "0011...",
+      "previous_slice_id": null,
+      "previous_slice_root_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "is_genesis": true,
+      "published_at": "2026-05-19T15:00:00Z",
+      "slice_ref": "slices/slc_genesis001.cbor",
+      "slice_root_ref": "slice_roots/slc_genesis001.bin"
+    },
+    {
+      "slice_id": "slc_4a3f2c1b9d8e",
+      "slice_root_hex": "deadbeef...",
+      "previous_slice_id": "slc_genesis001",
+      "previous_slice_root_hex": "0011...",
+      "is_genesis": false,
+      "published_at": "2026-05-19T18:30:00Z",
+      "slice_ref": "slices/slc_4a3f2c1b9d8e.cbor",
+      "slice_root_ref": "slice_roots/slc_4a3f2c1b9d8e.bin"
+    }
+  ],
+  "signed_at": "2026-05-19T18:35:00Z",
+  "chain_signature_hex": "..."
+}
+```
+
+**Reglas:**
+- **Orden:** topológico por Merkle predecessor (DEC-1 de Área D). NO wall-clock.
+- **Genesis entry:** `previous_slice_id: null`, `previous_slice_root_hex: "00…00"` (32 bytes cero), `is_genesis: true`. Q-A invariante verificada por gate 4 del validator.
+- **Append-only:** entries solo se agregan al final. Publisher NUNCA reescribe history.
+- **Pull incremental:** subscriber compara `head_slice_root_hex` local vs remoto; si distinto, fetchea desde primer entry posterior a su cursor local hasta `head`.
+- **Integridad cruzada:** subscriber re-valida que cada `previous_slice_root_hex[i+1] == slice_root_hex[i]`. Mismatch → reject entire chain (publisher corrupto o atacante).
+
+**Firma independiente (D-§4.3-1 = a):** `chain_signature_hex` es ed25519 con publisher key sobre canonical JSON excluyendo el campo signature. **Por qué firmar la chain además del manifest y los slices individuales:**
+- Subscriber puede pullear entity vía URL directa (shared-link mode, sin manifest).
+- Sin firma, atacante podría borrar entries del array (hiding slices reales) — subscriber solo verifica slices que fetchea, no notaría entries omitidos.
+- La firma de chain.json es el integrity belt del index. Per-slice CBOR sigue siendo la attestation real del contenido.
+
+### 4.4 `entities/<eid>/slices/slc_<sliceId>.cbor`
+
+- **Formato:** `SignedPackage` CBOR v5 shipped, sin modificaciones. HASH_DOMAIN `ckl-aether-pkg-cbor-v5\0`. MANIFEST_HASH_DOMAIN `ckl-aether-manifest-cbor-v2\0` (DEC-3 strict version reject).
+- **Granularidad:** un archivo = un slice atomic. NO multi-slice batching. Razón: idempotencia simple en subscriber (`try_put_slice_root` falla con `AppendOnlyViolation` si re-pull byte-idéntico es OK; partial batch sería ambiguo).
+- **Filename:** `slc_<sliceId>.cbor` — el prefijo `slc_` ya viene en el sliceId, NO se duplica.
+
+**Decisión D-§4.4-1 = (a) — blobs inline para MVP:** el `AetherPackage` shipped incluye blobs inline en los átomos. Para MVP de Área E mantenemos esa estructura tal cual:
+- Pros: simplifica E2 writer (no requiere split blob/manifest), reutiliza CBOR codec shipped sin cambios, evita pelea con shape del wire.
+- Contras: si dos slices comparten un átomo, su blob aparece duplicado en cada slice CBOR.
+- Mitigación: si profiling en E5/E6 dogfooding muestra dup significativo (> ~30% disk waste), entra como **BL-10** v0.4.x: nuevo wrapper `SliceFile` con blob_oid references + fetch separado desde `/blobs/`. No requiere cambio de wire format del slice individual — solo añade un container nuevo.
+
+**Implicación para §4.5:** `blobs/` directory queda vacío en MVP v0.4. Reservado para v0.4.x.
+
+### 4.5 `blobs/<blob_oid>` — CAS global del package (reservado MVP)
+
+- **Estado v0.4:** directory existe pero vacío. Blobs viven inline en `slices/slc_<sid>.cbor` (D-§4.4-1).
+- **Estado v0.4.x (planeado, BL-10):** si dedup justifica, este directory se llena con blobs deduplicados.
+
+**Schema futuro (cuando BL-10 active):**
+- **Filename:** `blob_oid` literal — SHA-1 hex de los content bytes (D-§4.5-1 = a). Consistente con `Block.blob_oid` shipped en CKL → cero migration cost del data model existente.
+- **Content:** raw bytes, opacos (sin Content-Type constraint a nivel transport).
+- **Integrity check:** subscriber recomputa SHA-1 al fetch y compara con filename. Mismatch → discard + log + counter `aether_blob_integrity_failed_total`.
+- **GC unreferenced:** deferred a D6 `Intent::PruneSliceVersions` (post-MVP, ya en BL-6).
+
+**Decisión D-§4.5-1 = (a) — SHA-1 mantenido:**
+- Risk de SHA-1 (Shattered 2017): collision artificial requiere ~$110K compute para CONTENT colliding pair. Para Aether blob_oid esto sería un **content collision** (atacante necesita producir contenido distinto con mismo hash), no una **signature forgery** (la firma vive en SliceManifest, no en blob hash).
+- Migration a SHA-256 = v0.5 full effort: nuevo dominio hash, re-stamp de TODO `Block.blob_oid` shipped, breaking change del wire.
+- Para MVP: consistency wins.
+
+### 4.6 URLs canónicos
+
+| Recurso | Pattern |
+|---|---|
+| Package root | `https://<host>/<publisher>/<package-name>/` |
+| Manifest | `https://<host>/<publisher>/<package-name>/pkg/manifest.json` |
+| Publisher cert | `https://<host>/<publisher>/<package-name>/pkg/publisher_cert.cbor` |
+| Entity chain | `https://<host>/<publisher>/<package-name>/entities/<eid>/chain.json` |
+| Slice | `https://<host>/<publisher>/<package-name>/entities/<eid>/slices/slc_<sliceId>.cbor` |
+| Slice root | `https://<host>/<publisher>/<package-name>/entities/<eid>/slice_roots/slc_<sliceId>.bin` |
+| Blob (futuro BL-10) | `https://<host>/<publisher>/<package-name>/blobs/<blob_oid>` |
+
+**Ejemplo real:**
+```
+https://koslab-devorg.github.io/aether-publications/ckl-internals/pkg/manifest.json
+https://koslab-devorg.github.io/aether-publications/ckl-internals/entities/ent_ckl_internals_v1/chain.json
+https://koslab-devorg.github.io/aether-publications/ckl-internals/entities/ent_ckl_internals_v1/slices/slc_4a3f2c1b9d8e.cbor
+https://koslab-devorg.github.io/aether-publications/ckl-internals/entities/ent_ckl_internals_v1/slice_roots/slc_4a3f2c1b9d8e.bin
+```
+
+Host MVP: `koslab-devorg.github.io/aether-publications/`. Fase 2: `aether.koslab.ai/` (CNAME).
+
+---
+
+## 5. Trust anchor distribution `[E-D2: config file con KOSLAB embedded]`
+
+### 5.1 `~/.kos/aether/trust.toml` schema
+
+```toml
+# Trust anchors — KOSLAB embedded por default en releases de ckl.
+# Editable por usuario para añadir publishers de terceros.
+schema_version = 1
+
+[[anchor]]
+publisher_id = "koslab"
+root_pubkey_hex = "a3f2c1..."
+source = "embedded"           # embedded | manual | imported
+added_at = "2026-05-19T00:00:00Z"
+notes = "KOSLAB root key, embedded in ckl v0.6.0+"
+fingerprint = "sha256:..."    # short hex para mostrar en CLI
+
+[[anchor]]
+publisher_id = "acme-research"
+root_pubkey_hex = "b2d4f9..."
+source = "manual"
+added_at = "2026-06-15T14:23:00Z"
+notes = "Added by Sergio for research subscription"
+```
+
+### 5.2 Bootstrap
+
+- Primera ejecución de `ckl aether <cmd>`: si `~/.kos/aether/trust.toml` no existe, se crea con el set embedded por release.
+- KOSLAB root pubkey vive en `ckl-aether-sign::DEFAULT_TRUST_ANCHORS` constante (recompile = update embedded set).
+- Usuario puede borrar el archivo → next exec lo regenera vacío excepto embedded.
+
+### 5.3 CLI
+
+```
+ckl aether trust list
+ckl aether trust add <publisher> --pubkey <hex> [--notes "..."]
+ckl aether trust update <publisher> --pubkey <new-hex>      # key rotation
+ckl aether trust revoke <publisher>                          # marca revocado, no borra
+ckl aether trust show <publisher>                            # detalle + fingerprint
+```
+
+### 5.4 Validación en verify pipeline
+
+`verify_package` recibe el set de anchors activos (no-revoked) y elige el que matche `cert.root_pubkey`. Si no hay match → `SignError::UnknownRootAnchor { root_pubkey_hex: String }`.
+
+**Decisión D-§5.4-1 = (a) — variant nueva dedicada:**
+
+```rust
+#[non_exhaustive]
+pub enum SignError {
+    // ... existentes
+    UnknownRootAnchor { root_pubkey_hex: String },
+}
+
+impl fmt::Display for SignError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // ...
+            Self::UnknownRootAnchor { root_pubkey_hex } => write!(
+                f,
+                "Unknown publisher root key {} — not in trust anchors. \
+                 To trust this publisher, run: ckl aether trust add <publisher_id> --pubkey {}",
+                root_pubkey_hex, root_pubkey_hex
+            ),
+        }
+    }
+}
+```
+
+**Por qué variant nueva (no reusar `InvalidCert`):**
+- Mensaje accionable: CLI puede sugerir el comando exacto.
+- Distingue "cert con firma rota" (`InvalidCert` — atacante o corrupción) de "cert OK pero publisher desconocido" (`UnknownRootAnchor` — falta config).
+- Subscribers UX: el usuario diferencia "esto está roto" de "yo no he configurado esto todavía".
+
+**Propagación:** la variant se surface en `ChainValidationError::SignatureVerificationFailed` (gate 1 del validator) sin nueva variant en `ChainValidationError` — el `#[source]` chain preserva el detalle. CLI inspect via `Error::source()` para mostrar el sugerencia.
+
+**Cero breaking change:** `SignError` ya es `#[non_exhaustive]` (pattern shipped en Área D). Downstream que match exhaustivo necesita añadir un arm `_ =>` (ya requerido por non_exhaustive).
+
+### 5.5 Rotación segura
+
+| Evento | Acción usuario | Side effect |
+|---|---|---|
+| KOSLAB rota root key (planificado) | Actualiza `ckl` a versión que embeb nueva pubkey **antes** de que KOSLAB switch | Embedded entry actualizada; old key queda en archivo como `source = "imported"` para verificar slices pre-rotación |
+| Publisher comprometido | `ckl aether trust revoke <publisher>` | Nuevos slices rechazados; los pre-revoke firmados siguen válidos (DEC-3 strict version, ver §10) |
+
+---
+
+## 6. Subscriber semantics `[E-D3: Strict + auto-add del URL]`
+
+### 6.1 Flujo `ckl aether subscribe <url>`
+
+```mermaid
+sequenceDiagram
+    participant U as Usuario
+    participant CLI as ckl
+    participant Trust as TrustStore
+    participant HTTP as HTTP layer
+    participant Store as AetherStore
+
+    U->>CLI: ckl aether subscribe https://.../ckl-internals/
+    CLI->>HTTP: fetch pkg/manifest.json
+    HTTP-->>CLI: manifest + publisher_cert
+    CLI->>Trust: verify cert against trust anchors
+    Trust-->>CLI: ok (KOSLAB anchor matches)
+
+    Note over CLI: Auto-add publisher a allowlist (E-D3)
+    CLI->>Store: Intent::SetPublisherAllowlist { publisher: "koslab", action: Allow }
+
+    CLI->>Store: Intent::UpsertSource { kind: Aether, project_id: None, name: "<package>", url: "..." }
+    Store-->>CLI: source_id + auto-bound entity_id (per entity en manifest)
+
+    CLI-->>U: Subscribed. Run `ckl aether sync` to pull.
+```
+
+### 6.2 Modos disponibles
+
+| Mode | Comportamiento | CLI flag |
+|---|---|---|
+| **Strict + auto-add** (default) | Solo accept publishers en allowlist; subscribe añade automáticamente | (sin flag) |
+| **Strict puro** | Solo accept publishers en allowlist; subscribe NO añade (usuario debe `ckl aether trust add` previo) | `--no-auto-trust` |
+| **Open** | Accept cualquier publisher cuya cert valide contra anchors | `--mode open` (advertencia visible) |
+
+### 6.3 Cross-publisher edges en Strict default
+
+- Edges de `koslab` que apuntan a `acme-research` (no allowed) llegan como `PendingEdge` (ya shipped Área C/H3).
+- Si usuario después hace `ckl aether subscribe https://acme-research/...`, el cascade resolver natural (BL-1 + E-D5) las promueve a `LocalRelationship`.
+- Si nunca llega → expira por TTL (`pending_edge_ttl_secs`, ya shipped).
+
+---
+
+## 7. Sync re-pull pass — cierre de T19 `[E-D5]`
+
+### 7.1 Problema
+
+Post-D9 + D8 sabemos: cuando el cascade resolver post-defer resuelve un slice diferido, escribe L1 (BSV + slice_root) pero NO dispatchea `Intent::ImportAetherPackage` → L2 (block + provenance + rels) queda vacía. T19 documenta esto como 🟡 self-healing.
+
+### 7.2 Solución — sync pass extra
+
+`ckl aether sync` ejecuta tres passes:
+
+**Pass A — pull incremental:** compara `chain.json` remoto vs cursor local, descarga slices nuevos, dispatch via `Intent::ImportAetherPackage` (path normal post-D9).
+
+**Pass B — cascade reconciliation `[NUEVO E-D5]`:** scan local `AetherStore` para `slice_root` rows que no tienen `Block` correspondiente en CKL workspace local (left-anti join). Para cada uno:
+1. Re-fetch slice CBOR desde HTTP (debería estar en cache local del Pass A).
+2. Re-dispatch via `Intent::ImportAetherPackage` con la misma data.
+3. Idempotencia: validator gates 8/9 verán BSV + slice_root existentes y devuelven `IngestOutcome::Imported(is_idempotent_replay=true)`; pero handler Área C escrituras (block + provenance + rel) se ejecutan normalmente porque NO había L2.
+
+**Pass C — pending GC:** evict PendingSlice/PendingEdge expirados por TTL (ya shipped).
+
+### 7.3 Idempotencia y costo
+
+- Pass B es no-op en caso steady-state (L1 == L2 siempre).
+- Costo solo se materializa cuando hay drift L1>L2 (caso cascade resolve, caso allowlist deny rectificado, caso futuro rate-limit drop reactivado).
+- Métrica: `aether_sync_pass_b_repaired_total` counter incrementa por slice reconciliado.
+
+### 7.4 Operationalize
+
+**Decisión D-§7.4-1 = (a) — Pass B always-on en `ckl aether sync`:**
+
+- Pass B corre en TODO `ckl aether sync` invocation, sin flag.
+- Costo bounded por O(N slice_roots locales) → sub-segundo para workspaces típicos (~100s slices).
+- Counter `aether_sync_pass_b_repaired_total` incrementa por slice reconciliado.
+- Si counter > 0 en una corrida → CLI emite warning visible al user (no error):
+  ```
+  ⚠ Reconciled 3 slices into workspace (L1→L2 drift detected).
+    This is normal after subscribing to a new publisher with cross-publisher edges.
+  ```
+- **Opt-out path (futuro v0.4.x si profiling justifica):** flag `--no-reconcile` opt-out (NO cambia default). NO se añade en MVP.
+
+**Por qué always-on en lugar de `--reconcile` opt-in:**
+- Self-healing automático — el usuario nunca tiene que saber del two-layer invariant.
+- Costo real es marginal vs el cost de queries que silenciosamente NO devuelven contenido válido.
+- Drift L1>L2 NUNCA es estado deseado en MVP; reconciliar siempre es semánticamente correcto.
+
+---
+
+## 8. Rate-limit per-publisher — diferido a Área F `[E-D4]`
+
+### 8.1 Decisión
+
+NO se implementa rate-limit en Área E. Razones:
+- T1 Bulk es **pull-based**: subscriber controla cadencia con cron / manual `sync` / scheduled task.
+- No hay surface DoS real — publisher malicioso no puede push, solo expose archivos estáticos que subscriber elige descargar o no.
+- PendingSlice caps shipped en D (10k global / 1k per-pub,src FIFO + TTL 7d) son safety net suficiente contra cascade explosion.
+
+### 8.2 Por qué entra en Área F
+
+Área F = T2 Query on-demand vía gRPC. Ahí sí:
+- Publisher tiene endpoint server que responde queries.
+- Subscriber puede ser saturado por publisher (push de respuestas large/many).
+- Server tiene CPU/network como recurso protegible.
+
+### 8.3 Backlog re-target
+
+- **BL-3** original ("Q-E rate-limit per-publisher T1 Bulk") → **re-targeted a Área F** como F-T1 (entry point del rate-limit en T2 transport).
+- Documentar transición explícita en backlog v0.4.x y en spec F draft.
+
+---
+
+## 9. Architectural choices abiertas `[ITERAR]`
+
+Las 5 decisiones load-bearing están cerradas. Quedan choices secundarias que se resolverán durante drafting de hitos.
+
+### 9.1 Crate boundary para HTTP fetch
+
+**Decisión D-§9.1-1 = (A) — Nuevo crate `ckl-aether-transport`:**
+
+```
+crates/
+├── ckl-aether-sign/          ← shipped (cert chain, Ed25519)
+├── ckl-aether-format/        ← shipped (CBOR v5 envelope)
+├── ckl-aether-client/        ← shipped, sigue pure-lib (cero cambio contrato)
+└── ckl-aether-transport/     ← NUEVO
+    ├── src/
+    │   ├── lib.rs            ← trait Transport { fn fetch(url) -> Result<Vec<u8>, Error>; }
+    │   ├── http.rs           ← HttpBackend (ureq impl)
+    │   ├── file.rs           ← FileBackend (file:// para fixtures + tests)
+    │   └── mock.rs           ← MockBackend (configurable responses para tests)
+    └── Cargo.toml
+```
+
+**Por qué nuevo crate (no feature flag):**
+- `ckl-aether-client` se mantiene pure-lib testeable (contrato shipped post-D9, no regresión).
+- Backends futuros (`s3://`, `ipfs://`, custom) añadidos sin tocar el cliente.
+- Tests integración con mock latency / errores 500 / paquetes truncados via `MockBackend` (no requiere setup async runtime).
+
+**Decisión D-§9.1-2 = `ureq` (sync HTTP client):**
+
+| Lib | Pros | Contras | Veredicto |
+|---|---|---|---|
+| `ureq` 2.x | Sync, ~5 deps total, simple API, perfecto para CLI one-shot | No async, no streaming HTTP/2 push | ✅ MVP |
+| `reqwest` 0.12 | Async, ricísima | Trae tokio+hyper (~50 deps), overkill para CLI | Migrar si v0.5 mete daemon |
+| `hyper` 1.x | Low-level | Demasiado bajo nivel para HTTP client genérico | No |
+| `curl` (binding) | Sistema | Dep externa libcurl, peor portabilidad | No |
+
+**Trade-off aceptado:** `ureq` bloquea el thread durante fetch. Para CLI `ckl aether sync` (one-shot), perfectamente OK. Si v0.5 introduce daemon que sincroniza N publishers concurrent → migración a `reqwest` (backend swap, no cambio de trait `Transport`).
+
+### 9.2 Hosting MVP — GitHub Pages limitaciones
+
+GitHub Pages tiene caps:
+- 1 GB total per repo.
+- 100 GB/mes bandwidth.
+- 10 builds/hora.
+- No streaming, no Range requests garantizados.
+
+**Decisión D-§9.2-1 = (A) — Un solo repo `Koslab-DevOrg/aether-publications/`:**
+
+```
+github.com/Koslab-DevOrg/aether-publications/
+├── README.md
+├── .github/workflows/publish.yml
+├── ckl-internals/            → koslab-devorg.github.io/aether-publications/ckl-internals/
+├── kos-patterns/             → koslab-devorg.github.io/aether-publications/kos-patterns/
+└── rust-curado/              → koslab-devorg.github.io/aether-publications/rust-curado/
+```
+
+**Cap budget MVP:** `ckl-internals` <2MB. 100 packages similares = 200MB → cabe holgadamente en cap de 1GB. Bandwidth: 100GB/mes / 2MB avg slice = ~50k pulls/mes — bastante para dogfooding.
+
+**Triggers para migrar a N-repos (post-MVP):**
+- Algún package crece >100MB (probable con embedded models, datasets large).
+- Necesidad de permisos granulares (e.g. dar write a un contributor sobre `kos-patterns` sin tocar `ckl-internals`).
+- Bandwidth se acerca a 80GB/mes sostenido.
+
+**Migración trivial cuando llegue:**
+1. Move `aether-publications/<pkg>/` → nuevo repo `aether-<pkg>/`.
+2. Anuncia nueva URL.
+3. Subscribers actualizan via `Intent::UpsertSource { url: new }` (firma es portable cross-host — T21 mitigation).
+4. Slices viejos siguen válidos en old URL durante grace period.
+
+**Costo de migración:** UI/anuncio + 1 commit por subscriber para `UpsertSource`. **NO** hay re-firma ni re-validation — todo el material publicado mantiene su validez criptográfica.
+
+### 9.3 Trigger del CI workflow
+
+**Decisión D-§9.3-1 = (A) `workflow_dispatch` manual para MVP.**
+
+El workflow `.github/workflows/publish.yml` se dispara **exclusivamente** vía botón "Run workflow" en la UI de GitHub Actions (o `gh workflow run publish.yml` desde CLI). Sin cron, sin `repository_dispatch`, sin auto-trigger por push.
+
+**Rationale:**
+
+1. **Operación de alto impacto.** Cada ejecución firma material con la `publisher_key` y empuja a `https://aether.koslab.ai/` (visible a cualquier subscriber). Un `publish` accidental es difícil de revertir — los subscribers ya pulled el nuevo `head_slice_id`, y si el contenido era erróneo hay que publicar un nuevo slice corrigiéndolo (no se puede "borrar" lo emitido sin romper la cadena).
+2. **Trigger humano = gate de revisión.** El operador hace dos pasos conscientes: (a) merge del PR de contenido en el repo workspace, (b) ir a Actions UI y correr `publish.yml`. Entre (a) y (b) hay ventana natural para "espera, esto va a publicarse a producción, ¿revisaste el diff de slices que se van a generar?".
+3. **MVP scope.** Frecuencia esperada en E5/E6: semanal o quincenal. No justifica automatización. Cuando el ritmo de publicación escale (E7+, post-dogfooding) reconsideramos.
+
+**Mitigación a "los humanos olvidan":**
+
+Checkbox obligatorio en PR template del repo workspace publisher (`koslab-publications` u otro):
+
+```markdown
+## Pre-merge checklist
+- [ ] Cambios revisados con `ckl aether dry-run` localmente
+- [ ] **Si se mergea: trigger `publish.yml` en GitHub Actions tras merge**
+- [ ] Notificar en #aether-publications canal Slack post-publish
+```
+
+No es un gate técnico (humano puede saltárselo), pero sí un recordatorio visible en el code review.
+
+**Migración path → (D) push-with-marker post-E6:**
+
+Cuando el flujo esté maduro (estable en producción 1-2 meses), considerar trigger automático condicionado:
+
+```yaml
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'content/**'  # solo si cambió contenido publishable
+  workflow_dispatch:  # manual sigue disponible como fallback
+```
+
+Pero esto requiere primero: (a) confianza en `dry-run` reproduciendo exactamente el output del CI, (b) gate de aprobación adicional (e.g. environment protection rules con required reviewer), (c) métricas baseline para detectar publishes anómalos. Fuera de scope E5/E6.
+
+**Descartadas:**
+
+- **(B) `repository_dispatch` cross-repo:** acopla CI de `aether-publications` a workflows en otro repo (workspace de Sergio o automatización KOSLAB). Más complejidad de auth (PAT cross-repo) sin beneficio claro vs (D).
+- **(C) Cron weekly:** publica aunque no haya cambios → ruido en `last_published_at` del manifest, signed_at avanza sin material nuevo, subscribers re-pull sin razón. Si queremos garantizar freshness, mejor monitoring que cron blindo.
+
+**Operacional MVP:**
+
+```bash
+# Desde laptop del publisher (Sergio/Alex), tras merge del PR de contenido:
+gh workflow run publish.yml --repo Koslab-DevOrg/aether-publications
+
+# O click manual en https://github.com/Koslab-DevOrg/aether-publications/actions/workflows/publish.yml
+```
+
+Resultado: workflow ejecuta `ckl aether publish`, push a `gh-pages`, GitHub Pages sirve nuevo contenido en ~30-60s.
+
+---
+
+## 10. Threat model entries (T20-T29)
+
+Área E expone nueva surface attack — HTTP transport, hosting estático, CI workflow, trust anchor distribution. 10 nuevas entries (T20-T29) catalogadas aquí; integración formal en doc `bf6f5e35-d` §11 nueva post-E shipped (patrón establecido en Áreas C/D).
+
+**Convenciones severidad:** 🟢 mitigado/aceptable · 🟡 mitigable con operacional · 🟠 alto impacto + mitigación parcial · 🔴 abierto/no mitigado.
+
+### 10.1 Catálogo
+
+| ID | Threat | Surface | Severidad | Mitigación shipped/specced |
+|---|---|---|---|---|
+| **T20** | MITM en HTTP fetch | Network entre publisher y subscriber | 🟢 | HTTPS-only hard (D-§10-1) + firma sobre payload final (cert+sig en envelope CBOR) → MITM no puede forjar contenido |
+| **T21** | Censorship / takedown del hosting | GitHub Pages, repo público | 🟡 | Firma portable cross-host (D-§9.2-1) → migración manual `source set-url` mantiene validez. Multi-mirror automático defer a Área G (D-§10-2, BL-9) |
+| **T22** | Supply chain attack en `ckl` release | KOSLAB embedded root pubkey corrupted | 🟠 | Multi-anchor trust file (usuario añade mirror anchor independiente). Reproducible builds aspirational (D-§10-3, BL-7). v0.5+ signed releases via cosign |
+| **T23** | Publisher key compromise en GitHub Secrets | GitHub Actions secrets layer | 🟡 | GitHub Secret encrypted MVP (D-§10-4) + key rotation procedure (Pipeline §T2.4). Root revoke + re-cert si comprometido. KMS-backed key v0.5+ (BL-8) |
+| **T24** | Trust file tampering local | Filesystem `~/.kos/aether/trust.toml` | 🟡 | OS-level permissions (`chmod 600` al init). `ckl aether trust list --verify-fingerprints` para audit manual. **[DEFERRED v0.4.1]** chmod 0o600 + `--verify-fingerprints` UX hardening deferido a v0.4.1 (PDA-3 decision, no es blocker para PoC). |
+| **T25** | Rollback attack (publisher sirve old slice como latest) | Hosting layer | 🟢 | Subscriber pinea `head_slice_root_hex` localmente. Hard fail `SyncError::RollbackDetected { local_head, remote_head }` (D-§10-5). Override explícito `ckl aether reset <source> --force` requerido |
+| **T26** | Slow loris / large payload DoS subscriber | HTTP layer | 🟢 | Caps configurables (D-§10-6): timeout 30s/request, max slice 10MB, max manifest 1MB, max chain.json 5MB. Excedido → `TransportError::PayloadTooLarge` o `TransportError::Timeout` |
+| **T27** | Trust file race condition (concurrent `trust add`) | Filesystem concurrent writers | 🟢 | File lock (`fs2::FileExt::lock_exclusive`) en `trust.toml` durante writes. Conflicto → segundo proceso espera y re-lee. Severidad baja (operación interactiva poco frecuente) |
+| **T28** | Decompression bomb si BL-10 activado (slice CBOR comprimido > MB ratio) | HTTP layer (futuro) | 🟡 | Deferred — solo aplica si activamos compresión slice (BL-10). Mitigación a documentar al activar: max decompressed size = 4× compressed cap |
+| **T29** | Subscriber tracking via HTTP request patterns (publisher infiere quién consume qué entity/slice) | Hosting access logs | 🟡 | MVP: no mitigación específica (subscribers pueden usar proxy/VPN si privacy crítica). Full mitigation requiere P2P transport (Área G T3 Discovery) o pull-via-mirror anonymizado |
+
+**Notas críticas:**
+
+1. **T20 cubierto-por-firma es clave conceptualmente.** Aun si el TLS estuviese roto (BGP hijack, CA comprometida), un attacker no puede inyectar contenido válido — necesita la `publisher_key` privada. HTTPS protege confidencialidad del consumo (T29) más que integridad del contenido. La integridad la garantiza la firma.
+
+2. **T22 vs T24 — el threat más serio en MVP.** Si KOSLAB ships una release de `ckl` con root pubkey corrupted, TODOS los nuevos installs trustean al attacker. T22 es por qué tenemos multi-anchor trust (usuario informado puede contrast-check). T24 es el daño-mínimo si solo un usuario es comprometido localmente.
+
+3. **T23 mitigation procedural, no técnico en MVP.** Si `publisher_key` se filtra de GitHub Secrets, el attacker puede firmar slices arbitrarios pero NO puede cambiar `publisher_cert` (firmado por root). KOSLAB respuesta: (a) root revoca publisher_cert, (b) emite nuevo publisher_cert con key fresca, (c) anuncia revocación. Subscribers que recibieron slices forjados antes del revoke quedan con material inválido — necesitan `ckl aether reset <source>` y re-pull desde nuevo cert.
+
+4. **T25 hard-fail es decisión load-bearing.** Implementación spec'd: en Pass A del sync, comparar `remote_manifest.entities[i].head_slice_root_hex` con `local_state.head_slice_root_hex`; si distinto AND remote_head no es descendiente de local_head en `chain.json` → `RollbackDetected`. Caso legítimo (publisher hizo legitimate rotation/reset) requiere comms out-of-band + `--force`.
+
+5. **T27/T29 categorías nuevas en Aether** (no presentes en Áreas A-D). T27 surge porque trust file es config global mutable; T29 surge porque T1 Bulk es HTTP centralizado (T2 Query en Área F y T3 Discovery en Área G mejoran ortogonalmente).
+
+### 10.2 Cross-reference a threat model doc
+
+Post-E shipped, las T20-T29 se moverán a `bf6f5e35-d` §11 nueva "Área E — T1 Bulk Transport Threats" siguiendo el patrón de §10 (Two-layer invariant Área D). Spec Área E mantendrá entry-point pointer compacto a la sección §11, evitando duplicación (lesson learned de Ola 2 Área D).
+
+**Decisiones load-bearing a preservar al merge:**
+
+- D-§10-1 HTTPS-only hard (T20 wire policy).
+- D-§10-5 rollback hard fail (T25 contract).
+- D-§10-6 caps numéricos (T26 implementation contract).
+
+**Backlog items derivados (ya en §11):**
+
+- BL-7 reproducible builds (T22).
+- BL-8 KMS-backed publisher key (T23).
+- BL-9 multi-mirror discovery (T21).
+- **BL-11 NUEVO** — T28 decompression cap activable cuando BL-10 (slice compression) ship.
+- **BL-12 NUEVO** — T29 mitigation via proxy/anonymized mirror (Área G dependency).
+
+---
+
+## 11. Backlog v0.4.x y v0.5
+
+Carry-over de Áreas previas + nuevos de E:
+
+| ID | Item | Origen | Target |
+|---|---|---|---|
+| BL-1 | Cascade resolver dispatches Intent via handler | Área D | ✅ se cierra en E (E-D5) |
+| BL-2 | Per-source PendingSlice eviction primitive | Área D | E o v0.4.x (re-evaluar en E3) |
+| BL-3 | Rate-limit per-publisher T1 Bulk | Área D | **re-targeted a Área F** (E-D4) |
+| BL-4 | slice_id como columna en `relationships` (si más Temporal variants) | Área D | Post-MVP |
+| BL-5 | Q-A genesis attestation final shape | Área D | Pre-D6 o post-MVP cripto hardening |
+| BL-6 | `Intent::PruneSliceVersions` + `pruned_slices` table | Área D | Post-MVP |
+| **BL-7** | Reproducible builds para `ckl` (T22 mitigation) | Área E | v0.4.x |
+| **BL-8** | KMS-backed publisher key (T23 strong mitigation) | Área E | v0.5+ |
+| **BL-9** | Multi-mirror discovery / fallback en `subscribe` | Área E | Área G (Discovery natural) |
+| **BL-10** | Compressed slice format (gzip/zstd) si MVP slices crecen | Área E | v0.4.x si caps Pages se acercan |
+| **BL-11** | Decompression bomb cap activable (T28 mitigation) | Área E §10 | Concurrente con BL-10 activate |
+| **BL-12** | T29 subscriber tracking mitigation (proxy/anonymized mirror) | Área E §10 | Área G (Discovery + P2P) |
+
+---
+
+## 12. Apéndice — Cross-references shipped
+
+| Concepto | Sección Concepto v0.2 | Sección Arquitectura v0 | Sección Pipeline v0 | Sección Área D | Sección Área E |
+|---|---|---|---|---|---|
+| T1 Bulk transport | §10 | §4 | toda | — | toda |
+| Pull-on-demand | §10 | §5 | §6.1 | — | §6, §7 |
+| Trust model | §13 | §3 | §2 | — | §5, §6 |
+| Publisher cert | — | (post-§3 H2) | §2.1 | §6.7 gate 1 | §5.4 |
+| Slice chain | — | — | — | §6.7 (9 gates) | §4.3 chain.json + §7.2 Pass B |
+| Two-layer invariant | — | — | — | §6.9 | §7 (Pass B cierra gap) |
+| Cascade resolver | — | — | — | §6.7 (gate 7-9) + INSIGHT H3 | §7.2 (Pass B) |
+| Pending edges | §11.2 | — | — | §6.7 (gates 5-9) | §6.3 |
+
+---
+
+## 13. Próximos pasos inmediatos
+
+### 13.1 Esta sesión (`260505-witty-fjord`)
+
+- ✅ Todos los `[TODO]` cerrados (Batches 1-5: §4 schemas, §5.4 SignError, §7.4 Pass B, §9.1-9.3 deploy, §10 threat catalog).
+- **Próximo:** flip `draft → review`, Sergio relee end-to-end, fix nits si hay, flip `review → published` (v0.2 final).
+
+### 13.2 En paralelo (`260514-long-heron`)
+
+- D9-b rehydration shipped (PR #141 merged) — desbloqueado totalmente.
+
+### 13.3 Post-spec v0.2 published
+
+- Brief para implementation agent (sesión nueva preferible — context fresco) con plan ejecutable arrancando en E1.
+- Hito E1 (layout writer publisher-side) primer commit en branch `feat/aether-v0.5` (nueva branch — Área E es 0.5, no extiende 0.4).
+- Crear repo `Koslab-DevOrg/aether-publications` (vacío + README + workflow stub) en paralelo a E1 (no bloquea código).
+- Decisión arquitectural pendiente NO bloqueante: `put_aether_cursor` dead path (3 opciones: remove / compat-shim / repurpose) — decidir antes o durante E2.
+
+---
+
+*v0.2 — PUBLISHED 2026-05-19 21:25 CST. 17 sub-decisiones lockeadas (E-D1 a E-D5 base + 12 de detalle en §4/§5/§7/§9/§10). Próximo: brief implementation agent → hito E1 (layout writer publisher-side) en branch `feat/aether-v0.5`.*
